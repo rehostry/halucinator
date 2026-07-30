@@ -131,3 +131,27 @@ class TestAutoPeripheral:
             p.hw_write(0x0, 1, ch, pc=0x8000)
         # the newline flushes the buffer
         assert p._out.get(0x40004400) == bytearray()
+
+
+# ===================== bare-name resolution in main =====================
+
+class TestBareNameResolution:
+    """`emulate: AutoPeripheral` (no dotted path) must resolve, via both
+    resolvers in halucinator.main."""
+
+    def test_instantiate_peripheral_resolves_bare_name(self):
+        import types
+        from halucinator import main
+        mem = types.SimpleNamespace(name="mmio", base_addr=0x40000000,
+                                    size=0x1000, properties=None)
+        periph = main._instantiate_peripheral("AutoPeripheral", mem, None)
+        assert periph is not None
+        assert periph.__class__.__name__ == "AutoPeripheral"
+
+    def test_instantiate_peripheral_bare_recording(self):
+        import types
+        from halucinator import main
+        mem = types.SimpleNamespace(name="mmio", base_addr=0x40000000,
+                                    size=0x1000, properties=None)
+        periph = main._instantiate_peripheral("RecordingPeripheral", mem, None)
+        assert periph.__class__.__name__ == "RecordingPeripheral"
