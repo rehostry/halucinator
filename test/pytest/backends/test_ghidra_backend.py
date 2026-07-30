@@ -166,6 +166,10 @@ def test_live_thumb_step(tmp_path):
 
 
 @pytest.mark.skipif(not _HAVE_PYGHIDRA, reason="pyghidra not installed")
+@pytest.mark.skipif(
+    not __import__("os").environ.get("GHIDRA_INSTALL_DIR"),
+    reason="GHIDRA_INSTALL_DIR not set",
+)
 def test_live_snapshot_restore(tmp_path):
     """The Ghidra p-code backend uses the generic reg+RAM snapshot fallback;
     verify a full save -> clobber -> restore round-trip on the real emulator."""
