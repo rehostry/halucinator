@@ -2329,7 +2329,8 @@ class UnicornBackend(ARMHalMixin, HalBackend):
         # a PSP thread). The return address is the current PC.
         if self.arch_name == "cortex-m3":
             cur_pc = self.read_register("pc")
-            self._cortexm_exception_entry(isr_slot, cur_pc, "irq%d" % irq_num)
+            self._cortexm_exception_entry(isr_slot, cur_pc, "irq%d" % irq_num,
+                                         exc_num=16 + irq_num)
             return
         isr_addr = 0
         try:
@@ -2527,7 +2528,8 @@ class UnicornBackend(ARMHalMixin, HalBackend):
         self._cortexm_exception_entry(14 * 4 + vtor, cur_pc, "PendSV")
 
     def _cortexm_exception_entry(self, vector_slot: int, return_pc: int,
-                                 label: str) -> bool:
+                                 label: str, exc_num: Optional[int] = None
+                                 ) -> bool:
         """Architecturally-correct Cortex-M exception entry.
 
         Stacks the 8-word hardware frame on the stack the CPU is *currently*
@@ -2536,6 +2538,25 @@ class UnicornBackend(ARMHalMixin, HalBackend):
         (SPSEL=0) and vectors to the handler. This MSP/PSP banking is what an
         RTOS context switch depends on: isr_svc/isr_pendsv run on MSP while the
         outgoing thread's frame sits on its PSP. Returns True on success.
+
+        ``exc_num`` is the architectural exception number (16 + IRQ for an
+        external interrupt, 11 SVCall, 14 PendSV, 15 SysTick). When given, it is
+        written to IPSR *after* the frame is stacked, so the handler sees the
+        right value while the stacked xPSR still carries the interrupted
+        context's IPSR (which the EXC_RETURN unwind restores).
+
+        Setting IPSR is not cosmetic. An RTOS whose vector table points every
+        external IRQ at ONE shared trampoline recovers the interrupt number from
+        IPSR to index its own dispatch table -- Zephyr's ``_isr_wrapper`` does
+
+            mrs r0, IPSR ; sub r0, #16 ; ldr r1, =_sw_isr_table
+            add r1, r1, r0, lsl #3 ; ldm r1, {r0, r3} ; blx r3
+
+        With IPSR left at 0 that indexes the table at -16, loads a null ISR and
+        branches to 0 -- surfacing as ``UC_ERR_FETCH_UNMAPPED at PC=0`` with the
+        trampoline in LR, which looks like a firmware bug rather than a missing
+        register. Firmware with a fully-populated vector table (one entry per
+        IRQ) never reads IPSR and so never noticed this was missing.
         """
         if self._uc is None:
             return False
@@ -2583,6 +2604,15 @@ class UnicornBackend(ARMHalMixin, HalBackend):
             self.write_register("sp", sp)
         self.write_register("lr", exc_return)
         self.write_register("pc", handler & ~1)
+        # IPSR *after* stacking: the frame must keep the interrupted context's
+        # exception number, while the handler must see its own.
+        if exc_num is not None:
+            try:
+                self._uc.reg_write(arm.UC_ARM_REG_IPSR, exc_num & 0x1FF)
+            except Exception:  # noqa: BLE001 — older unicorn without IPSR
+                log.debug("cortexm_%s: IPSR unavailable; a shared-trampoline "
+                          "RTOS dispatcher will not find its IRQ number",
+                          label)
         self._cortexm_exc_depth = getattr(self, "_cortexm_exc_depth", 0) + 1
         self._cortexm_in_handler = True  # now in Handler mode
         log.info("cortexm_%s: entry -> handler 0x%x (ret 0x%x, %s, depth=%d)",
@@ -2659,6 +2689,23 @@ class UnicornBackend(ARMHalMixin, HalBackend):
         self.write_register("lr", frame[5])
         self.write_register("pc", frame[6])
         self.write_register("cpsr", frame[7])
+        # Clear IPSR when unwinding to Thread mode. unicorn exposes IPSR as its
+        # own register, so the CPSR write above does NOT clear it, and a stale
+        # exception number is not cosmetic: Zephyr's arch_is_in_isr() (and the
+        # equivalent in most RTOSes) is literally "IPSR != 0", so a sticky value
+        # makes every thread believe it is in interrupt context -- k_sleep stops
+        # yielding and the scheduler quietly stalls.
+        #
+        # Do NOT derive the value from the stacked xPSR: unicorn's "cpsr" read on
+        # its M-profile core includes the ARM mode field, so frame[7] & 0x1FF is
+        # 0x10 (User mode) rather than 0, which would restore IPSR as exception
+        # 16 -- a phantom external IRQ 0. Returning to Handler mode is left alone
+        # (a nested handler keeps its own number).
+        if returns_to_thread:
+            try:
+                self._uc.reg_write(unicorn.arm_const.UC_ARM_REG_IPSR, 0)
+            except Exception:  # noqa: BLE001 — older unicorn without IPSR
+                pass
         new_sp = sp + 32
         if use_psp:
             # Thread now runs on PSP: point both PSP and the active SP at the
