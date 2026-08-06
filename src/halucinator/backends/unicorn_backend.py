@@ -553,6 +553,15 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         # Cache arch traits from _ARCH_MAP for hot paths (cont/read_memory).
         info = _ARCH_MAP.get(arch, ("arm", "thumb", True, False, 4))
         _, _, self._is_thumb, self._is_be, self._word_size = info
+        # Opt-in: honour PRIMASK/FAULTMASK when delivering a Cortex-M IRQ.
+        # Off by default because it changes interrupt timing fleet-wide --
+        # see _cortexm_irq_deferred() for the measured evidence both ways.
+        self._cortexm_primask_guard = (
+            _os.environ.get("HAL_CORTEXM_PRIMASK_GUARD", "0")
+            not in ("0", "", "false", "False"))
+        if self._cortexm_primask_guard:
+            log.info("cortex-m: PRIMASK/FAULTMASK delivery guard ENABLED "
+                     "(HAL_CORTEXM_PRIMASK_GUARD)")
 
         # Bind the arch-specific ABI mixin onto the instance (ARM32 stays the
         # default via inheritance so existing arm/cortex-m callers are
@@ -1995,6 +2004,80 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
             self.arch_name, ("arm", "thumb", True, False, 4))
         return arch_str == "arm" and mode_str == "thumb"
 
+    def _cortexm_irq_deferred(self, irq_num: int) -> bool:
+        """True when a maskable Cortex-M IRQ must not be delivered *yet*.
+
+        Cortex-M delivery here never consulted ``PRIMASK``/``FAULTMASK``, and
+        the pending queue is drained at instruction-**chunk** boundaries. So an
+        IRQ queued while interrupts were enabled could be applied an arbitrary
+        number of instructions later, at whatever PC the chunk happened to end
+        on -- including inside a critical section that had since disabled them.
+        Silicon holds such an interrupt pending until the mask clears; we
+        delivered it anyway.
+
+        On ARMv6-M ChibiOS that is fatal rather than merely inaccurate. Every
+        context switch ends with
+
+            str r3, [r2]     ; SCB->ICSR = NMIPENDSET
+            b   .            ; wait for the NMI
+
+        run with interrupts disabled precisely so it is atomic. An IRQ taken on
+        that ``b .`` stacks a frame whose PC is the ``b .``; the NMI handler
+        discards its own frame (``PSP += 32``) and its exception return then
+        lands on the leftover frame, so the CPU resumes at the ``b .`` *without
+        ever executing the store*. NMIPENDSET is never set and the switch can
+        never complete. Measured on device-nanovna-h before this guard: exactly
+        23 NMIs, then 2,817,851 samples at one address with ``ICSR=0x00000800``
+        at every hit.
+
+        Scope, deliberately narrow:
+
+        * Only **external** interrupts (``irq_num >= 0``) are held. Internal
+          exceptions keep their existing behaviour -- notably SVCall, which
+          several FreeRTOS devices rely on to launch their first task. Real
+          silicon escalates an ``svc`` executed under PRIMASK to a HardFault;
+          emulating that here would change behaviour for devices that work
+          today, so it is left alone and noted as a known divergence.
+        * ``BASEPRI`` is **not** consulted: honouring it needs each IRQ's
+          configured priority, which this backend does not model.
+        * Non-M-profile targets are untouched; A-profile already handles its
+          own masking (``_apply_pending_irq_armv7a``).
+
+        The IRQ stays queued rather than being dropped, so no interrupt is
+        lost; the caller breaks out of the drain loop so the guest runs and can
+        unmask itself. That is why this cannot busy-spin the way re-queueing
+        inside the drain would.
+
+        **OPT-IN, and deliberately so.** Set ``HAL_CORTEXM_PRIMASK_GUARD=1`` to
+        enable it. Honouring the masks is the faithful behaviour, but it changes
+        *when* every Cortex-M interrupt in a rehost is taken, and the fleet's
+        device models queue interrupts from MMIO beats and breakpoint handlers
+        at points where silicon would not necessarily have asserted them. A
+        device tuned against the unguarded behaviour can therefore stall:
+        measured on device-tinysa (STM32F072/ChibiOS), enabling this drops
+        delivery from 285 injections to 55 and the firmware never reaches its
+        shell, while device-nanovna-h — same SoC family, same RTOS — *requires*
+        it and today carries a local wrapper around ``_apply_pending_irq`` to
+        get it. Until the whole fleet is re-verified with it on, the default
+        stays off so no existing device changes behaviour.
+        """
+        if not self._cortexm_primask_guard:
+            return False
+        if irq_num < 0 or not self._is_arm_profile_m():
+            return False
+        try:
+            primask = self._uc.reg_read(arm_const.UC_ARM_REG_PRIMASK)
+            faultmask = self._uc.reg_read(arm_const.UC_ARM_REG_FAULTMASK)
+            ipsr = self._uc.reg_read(arm_const.UC_ARM_REG_IPSR)
+        except Exception:  # noqa: BLE001 - register absent on this build
+            return False
+        # IPSR != 0 means we are already inside a handler: stacking a second
+        # exception on one that has not executed an instruction is the other
+        # half of the same bug (playbook trap 98). Both conditions come from
+        # the only implementation validated against real firmware,
+        # device-nanovna-h's irq_deliverable().
+        return bool((primask & 1) or (faultmask & 1) or ipsr)
+
     def _capture_banked_regs(self) -> Dict[str, Dict[str, int]]:
         """A-profile: visit each banked mode via raw CPSR writes and read its
         sp/lr/spsr (+ r8-r12 for fiq). CPSR is always restored, even if a
@@ -2499,6 +2582,27 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
             # resuming — the synthetic exception frame setup mutates
             # PC/SP, only safe when emu_start is not running.
             while self._pending_irqs:
+                # Silicon holds a maskable interrupt pending while PRIMASK /
+                # FAULTMASK are set, but an NMI is never masked — so skip over
+                # held entries to the first deliverable one rather than
+                # blocking the head of the queue. Starving a queued NMI behind
+                # a masked IRQ would break exactly the ChibiOS ARMv6-M context
+                # switch this guard exists to protect. See
+                # _cortexm_irq_deferred(). Anything still held stays queued and
+                # is retried after the next chunk, once the guest has had a
+                # chance to unmask itself; leaving the loop (rather than
+                # re-queueing inside it) is what keeps this from busy-spinning.
+                _head = self._pending_irqs[0]
+                if self._cortexm_irq_deferred(_head):
+                    # DROP, don't hold. Silicon would keep it pending, but the
+                    # sources in this backend re-assert (a timer compare stays
+                    # due until taken; a peripheral keeps its flag latched
+                    # until the firmware's own ISR clears it), whereas holding
+                    # it delivers it later at a PC silicon never would have —
+                    # which is the bug this guard exists to stop. Dropping is
+                    # what device-nanovna-h validated against real firmware.
+                    self._pending_irqs.pop(0)
+                    continue
                 self._apply_pending_irq(self._pending_irqs.pop(0))
             # Deliver a PendSV requested from thread mode (the ICSR write hook
             # emu_stop'd us and parked PC on the store). Done here, at the top of
