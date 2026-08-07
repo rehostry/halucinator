@@ -41,11 +41,26 @@ class InProcessIrqMixin:
     # FPU the value also carries bit 4 = "no floating-point context stacked",
     # so an FP-context return is 0xFFFFFFE1/E9/ED -- masking to the top nibble
     # (0xFFFFFFFx) silently fails to recognise those, and the ISR's `bx lr`
-    # is then executed as a branch to an unmapped address. Match bits 31:5
-    # instead, which is what the architecture defines.
+    # is then executed as a branch to an unmapped address.
+    #
+    # ARMv8-M (Cortex-M33) widens the field again. Its EXC_RETURN carries two
+    # more flags below the v7-M ones -- bit 6 = S (came from Secure) and bit 5 =
+    # DCRS (default callee register stacking) -- so a NON-secure return has bit 6
+    # clear and the value drops out of the 0xFFFFFFE0 window entirely. A plain
+    # non-secure Zephyr ISR returns via 0xFFFFFFBC, which bits-31:5 matching
+    # rejects; the `bx lr` is then branched to and the CPU faults there forever.
+    # Observed on device-golioth-nrf9160 (nRF9160, TF-M non-secure image) as
+    # 7.7 MILLION repetitions of "CPU exception/interrupt 8 at pc=0xffffffbc"
+    # with no forward progress and no other diagnostic.
+    #
+    # The architecture defines EXC_RETURN as bits[31:7] all ones, so match
+    # bits 31:7. That is a superset of the v7-M range, so v7-M parts are
+    # unaffected -- and no executable code can legitimately live at
+    # 0xFFFFFF80..0xFFFFFFFF on either profile, which is why the range is
+    # reserved for this purpose in the first place.
     _EXC_RETURN_THREAD_MSP = 0xFFFFFFF9
-    _EXC_RETURN_MASK = 0xFFFFFFE0
-    _EXC_RETURN_MAGIC = 0xFFFFFFE0
+    _EXC_RETURN_MASK = 0xFFFFFF80
+    _EXC_RETURN_MAGIC = 0xFFFFFF80
 
     def _decode_exc_return_frame(self, pc: int):
         """If *pc* is a Cortex-M EXC_RETURN magic value, read and unpack the
