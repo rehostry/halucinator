@@ -924,11 +924,21 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
             self._pc_n = 0
             _every = int(_os.environ.get("HAL_PC_SAMPLE_EVERY", "3000000"))
 
+            # HAL_PC_SAMPLE_RESET=1 makes each dump a WINDOW rather than a
+            # running total. Without it an early hot loop -- a memset, a
+            # signature check, a boot-time delay -- owns the top-10 for the
+            # rest of the run, and a later hang stays invisible until it
+            # out-counts it. The symptom is identical counts dump after dump
+            # while execution is somewhere else entirely.
+            _reset = _os.environ.get("HAL_PC_SAMPLE_RESET") == "1"
+
             def _pc_sample(uc, addr, size, ud):
                 self._pc_hist[addr & ~1] += 1
                 self._pc_n += 1
                 if _every and self._pc_n % _every == 0:
                     self.dump_pc_sample()
+                    if _reset:
+                        self._pc_hist.clear()
             self._uc.hook_add(unicorn.UC_HOOK_CODE, _pc_sample)
 
         # HAL_DET_TICK deterministic system-clock tick is parsed in
@@ -1139,19 +1149,43 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         if _st and arch_str == "arm":
             _spec = _st.split(":", 1)
             _lo, _hi = (int(x, 0) for x in _spec[0].split("-"))
-            _stf = open(_spec[1] if len(_spec) > 1 else "/tmp/hal_step_trace.txt", "w")
+            _path = _spec[1] if len(_spec) > 1 else "/tmp/hal_step_trace.txt"
+            # KEEP THE **LAST** N LINES, NOT THE FIRST. The question this tool
+            # is nearly always asked is "what was the guest doing just before
+            # it went quiet", and a head-capped trace answers the opposite one:
+            # it fills up during boot and then records nothing, so the tail of
+            # the file is wherever the cap happened to fall. That reads exactly
+            # like a stall at that address, which is a real way to lose an hour.
+            #
+            # HAL_STEP_TRACE_LINES sets the depth. The ring is rewritten to the
+            # file periodically so the file is useful even if the run is killed.
+            _depth = int(_os.environ.get("HAL_STEP_TRACE_LINES", "20000"), 0)
+            from collections import deque as _deque
+            _ring = _deque(maxlen=_depth)
             _st_n = {"n": 0}
             _rmap = self._reg_map
+
+            def _spill():
+                try:
+                    with open(_path, "w") as fh:
+                        fh.writelines(_ring)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            self._step_trace_spill = _spill
+
             def _step_trace(uc, addr, size, ud):
-                if not (_lo <= addr < _hi) or _st_n["n"] >= 200000:
+                if not (_lo <= addr < _hi):
                     return
                 _st_n["n"] += 1
                 try:
                     vals = tuple(uc.reg_read(_rmap.get(r)) for r in
                                  ("sp", "r0", "r1", "r2", "r3", "r10", "r12", "lr"))
-                    _stf.write("0x%08x sp=0x%08x r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x "
-                               "sl=0x%08x ip=0x%08x lr=0x%08x\n" % ((addr,) + vals))
-                    _stf.flush()
+                    _ring.append(
+                        "0x%08x sp=0x%08x r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x "
+                        "sl=0x%08x ip=0x%08x lr=0x%08x\n" % ((addr,) + vals))
+                    if _st_n["n"] % (_depth // 2 or 1) == 0:
+                        _spill()
                 except Exception:
                     pass
             self._uc.hook_add(unicorn.UC_HOOK_CODE, _step_trace)
