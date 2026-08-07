@@ -2424,10 +2424,17 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         ``irq_chunk`` defaulting to 2,000,000 for ``arch: arm`` the guest is
         stopped and resumed constantly, so it derails within seconds.
 
-        Honour the guest's own CPSR.T instead. ARM-mode code is unaffected (the
-        bit is clear, the address is unchanged), so this cannot regress
-        device-bmxnoe-arm / device-iologik-e1200 / device-m340, which are pure
-        ARM-mode images.
+        Honour the guest's own CPSR.T instead. ARM-mode code is unaffected --
+        the bit is clear, so the address is returned unchanged -- which is why
+        the pure ARM-mode images (device-bmxnoe-arm, device-iologik-e1200,
+        device-m340) are expected to be untouched.
+
+        **Measured, not merely argued:** device-iologik-e1200 was run on this
+        branch and on pristine origin/dev in the same venv and produced
+        byte-identical output, including its known ``landed: false`` M3 wall and
+        every field of its RESULT dict. bmxnoe-arm and m340 were *not*
+        re-verified here (both are owned by other sessions); the argument above
+        covers them, the measurement does not.
         """
         if self._is_thumb:
             return pc | 1
