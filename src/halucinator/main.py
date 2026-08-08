@@ -1153,6 +1153,14 @@ def _emulate_with_unicorn_backend(
                         # be able to abort the run from its own wiring.
                         log.exception("peripheral %s: set_backend failed",
                                       emulate_name)
+                # Also expose it as a plain attribute: a model that just reads
+                # `self.hal_backend` to REQUEST an interrupt (a ColdFire INTC
+                # force-interrupt register, an RTOS doorbell) needs no
+                # set_backend method. Harmless alongside the setter above.
+                try:
+                    periph.hal_backend = backend
+                except Exception:  # noqa: BLE001
+                    pass
                 auto_peripherals.append(periph)
                 if periph.__class__.__name__ == "AutoPeripheral":
                     backend.skip_svc = True
