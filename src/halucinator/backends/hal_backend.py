@@ -761,7 +761,6 @@ class X86HalMixin(_ABIBase):
         self.cont()
 
 
-<<<<<<< HEAD
 class RISCVHalMixin(_ABIBase):
     """
     RV32 ILP32 ABI: args in a0–a7 (x10–x17) then stack, return addr in ra
@@ -847,7 +846,7 @@ class M68KHalMixin(_ABIBase):
         regs = {"sp": sp + 4, "pc": ret_addr}
         if ret_value is not None:
             regs["d0"] = ret_value & 0xFFFFFFFF
-=======
+
 class SPARCHalMixin(_ABIBase):
     """
     SPARC V8 (Gaisler LEON) ABI: the first six arguments arrive in %o0-%o5,
@@ -921,7 +920,6 @@ class SPARCHalMixin(_ABIBase):
         regs = {"pc": (self.read_register("o7") + 8) & 0xFFFFFFFF}
         if ret_value is not None:
             regs["o0"] = ret_value & 0xFFFFFFFF
->>>>>>> upstream/master
         self.write_registers(regs)
         self.cont()
 
@@ -945,15 +943,13 @@ ABI_MIXINS: Dict[str, type] = {
     "powerpc:MPC8XX": PowerPCHalMixin,
     "ppc64":     PowerPC64HalMixin,
     "x86":       X86HalMixin,
-<<<<<<< HEAD
     "tricore":   TriCoreHalMixin,
     "riscv32":   RISCVHalMixin,
     "m68k":      M68KHalMixin,
-=======
+
     # Without this entry _bind_abi falls back to ARM32HalMixin *silently* --
     # the fallback IS the default, so the rebinding branch never runs -- and
     # the first intercept to read an argument dies with "Unknown register:
     # 'r0'", because r0 is not in the SPARC register map.
     "sparc":     SPARCHalMixin,
->>>>>>> upstream/master
 }
