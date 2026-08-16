@@ -1051,13 +1051,34 @@ def _instantiate_peripheral(name: str, memory: Any, db_path: str) -> Any:
     # peripherals were always built with their default db_path=None and no
     # trace was ever persisted. Gated on the signature: most peripherals take
     # no db_path and would raise TypeError.
+    # ONLY an explicitly named db_path parameter counts. Treating a **kwargs
+    # constructor as "accepts db_path" is wrong and actively harmful: most
+    # device peripheral models take **kwargs to soak up their YAML `properties`,
+    # so that rule injected a db_path into peripherals that never asked for one.
+    # Measured cost: ardupilot-sub-pixhawk1 and duet3-mb6hc boot and then fail
+    # to land, because every peripheral they map (CortexMScs, Same70Bus,
+    # SocCatchAll) has a **kwargs constructor.
+    #
+    # The peripherals that genuinely want the trace path name it -- both
+    # RecordingPeripheral and AutoPeripheral declare `db_path=None` explicitly
+    # -- so requiring the name loses nothing.
     try:
         params = inspect.signature(cls).parameters
-        takes_db = "db_path" in params or any(
-            pp.kind is inspect.Parameter.VAR_KEYWORD for pp in params.values())
+        takes_db = "db_path" in params
     except (TypeError, ValueError):  # pragma: no cover
         takes_db = False
-    if takes_db and db_path is not None:
+    # ...and only when the run actually ASKED for a trace. Forwarding it
+    # unconditionally turns MMIO recording on for every device whose
+    # peripherals accept the argument, and recording is not free: it adds a
+    # per-access append plus periodic SQLite writes on the hot path. Measured
+    # cost of the unconditional version: device-ardupilot-sub-pixhawk1 boots
+    # and then fails to land, because its SocCatchAll names db_path and so
+    # started recording every access.
+    #
+    # Opt-in via HAL_MMIO_TRACE=1. That keeps the record -> infer -> synthesize
+    # loop working for the runs that want it (which is the whole point of
+    # forwarding db_path at all) while leaving the fleet's timing untouched.
+    if takes_db and db_path is not None and os.environ.get("HAL_MMIO_TRACE") == "1":
         kwargs["db_path"] = db_path
     # Pull peripheral-specific kwargs from the YAML `properties` block
     # (HalMemConfig.properties is the generic per-peripheral dict slot).

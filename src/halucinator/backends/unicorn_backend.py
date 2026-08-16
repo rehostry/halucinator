@@ -644,6 +644,8 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         self._m_manual_bank: bool = False
         self._m_spsel: bool = False
         self._m_saved_msp = None
+        self._m_restore_nested_ipsr = (
+            os.environ.get("HAL_CORTEXM_RESTORE_NESTED_IPSR", "0") == "1")
 
         # Generic non-MMIO loop breaker (see _code_hook). Opt-in.
         self.auto_recover_loops: bool = False
@@ -4129,12 +4131,26 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                 control = self._uc.reg_read(_A.UC_ARM_REG_CONTROL)
                 control = (control | 2) if return_psp else (control & ~2)
                 self._uc.reg_write(_A.UC_ARM_REG_CONTROL, control)
-        elif frame[7] & 0x1FF:
+        elif frame[7] & 0x1FF and self._m_restore_nested_ipsr:
             # Returning to handler mode: put the preempted exception number
-            # back. Guarded on the stacked value being non-zero, because RTOS
-            # ports synthesise exception frames (ChibiOS' _port_irq_epilogue
-            # builds one carrying only the T bit) and writing 0 there would
-            # drop a running handler into thread mode -- the opposite mistake.
+            # back -- but ONLY when the target asks for it. The stacked xPSR is
+            # trustworthy when HARDWARE built the frame; RTOS ports build them
+            # by hand (ChibiOS' _port_irq_epilogue, the Nordic SoftDevice
+            # dispatcher) and put whatever suits their own unwind in xPSR.
+            # Feeding those low 9 bits into IPSR parks the core in an exception
+            # that was never taken: the guest still boots, and every
+            # priority/active-vector decision after that is made on a bogus
+            # number. MEASURED: unconditionally restoring costs
+            # device-ble-rscs-nrf52832 its attack landing.
+            #
+            # rusEFI/FOME's assertInterruptPriority() genuinely needs the
+            # restore, so it stays available via
+            # HAL_CORTEXM_RESTORE_NESTED_IPSR=1.
+            #
+            # A shadow stack of preempted IPSR values is NOT a substitute:
+            # deliveries and returns are not balanced (the firmware takes
+            # exceptions this backend never delivered), so it desynchronises and
+            # pops a stale number. Verified BAD on the same device.
             self._uc.reg_write(_A.UC_ARM_REG_IPSR, frame[7] & 0x1FF)
         # ICSR follows the mode change: VECTACTIVE is the exception we are
         # returning TO (0 in thread mode).
