@@ -2666,6 +2666,44 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
     # Execution control
     # ------------------------------------------------------------------
 
+    def _resume_addr(self, pc: int) -> int:
+        """The address to hand ``emu_start`` so the CPU keeps its instruction set.
+
+        unicorn's ``arm_set_pc()`` derives the Thumb flag from **bit 0 of the
+        start address on every single ``emu_start`` call** -- it does not read
+        the flag back out of CPSR. For an M-profile target that is invisible,
+        because ``_is_thumb`` is always True and we always OR in the 1. For an
+        **A-profile ARM** target (``arch: arm``) it is a silent correctness bug:
+        the moment the guest is executing Thumb (ARMv4T/v5 interworking, i.e.
+        anything built ``-mthumb`` / ``-mthumb-interwork``) and we stop -- at a
+        breakpoint, at an ``irq_chunk`` boundary, in ``step()`` -- resuming from
+        the even PC puts the CPU back into ARM decoding, and the *next*
+        instruction is decoded as garbage. Measured directly on unicorn 2.1.4:
+        two Thumb instructions at 0x1000, single-step the first, resume at
+        0x1002 -> ``UC_ERR_READ_UNMAPPED``; resume at 0x1003 -> correct.
+
+        This is not exotic: the AT91SAM7 (ARM7TDMI) Proxmark3 firmware compiles
+        its application in Thumb and only its USB/FPGA/command drivers in ARM,
+        which is the normal shape for every classic-ARM embedded image. With
+        ``irq_chunk`` defaulting to 2,000,000 for ``arch: arm`` the guest is
+        stopped and resumed constantly, so it derails within seconds.
+
+        Honour the guest's own CPSR.T instead. ARM-mode code is unaffected (the
+        bit is clear, the address is unchanged), so this cannot regress
+        device-bmxnoe-arm / device-iologik-e1200 / device-m340, which are pure
+        ARM-mode images.
+        """
+        if self._is_thumb:
+            return pc | 1
+        if self._is_arm_profile_a():
+            try:
+                cpsr = self._uc.reg_read(arm_const.UC_ARM_REG_CPSR)
+            except Exception:  # noqa: BLE001 - no CPSR on this build; keep old behaviour
+                return pc
+            if cpsr & 0x20:            # CPSR.T -- the guest is in Thumb state
+                return pc | 1
+        return pc
+
     def _install_bp_hook(self, addr: int) -> None:
         """Fast-bp mode: install a range-bounded UC_HOOK_CODE for one breakpoint
         address so Unicorn only enters _code_hook at that PC (blocks elsewhere
@@ -2859,9 +2897,9 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
             if getattr(self, "_pendsv_store_parked", False):
                 self._maybe_deliver_thread_pendsv()
             pc = self.read_register("pc")
-            # Unicorn Thumb mode needs the LSB set on the start
-            # address.
-            start = (pc | 1) if self._is_thumb else pc
+            # Unicorn takes the instruction set from bit 0 of the start
+            # address on EVERY emu_start -- see _resume_addr().
+            start = self._resume_addr(pc)
             # ADAPTIVE CHUNK: an interrupt that is asserted but currently MASKED
             # can only be re-tried at a chunk boundary. Firmware that spins
             # waiting for that interrupt's handler to run -- FreeRTOS's
@@ -3179,7 +3217,7 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         if self._uc is None:
             raise RuntimeError("Call UnicornBackend.init() first")
         pc = self.read_register("pc")
-        start = (pc | 1) if self._is_thumb else pc
+        start = self._resume_addr(pc)
         until = (1 << (self._word_size * 8)) - 1
         self._uc.emu_start(start, until, timeout=0, count=1)
 
@@ -3731,7 +3769,7 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         if self._uc is None:
             return
         pc = self.read_register("pc")
-        start = (pc | 1) if self._is_thumb else pc
+        start = self._resume_addr(pc)
         until = (1 << (self._word_size * 8)) - 1
         try:
             self._uc.emu_start(start, until, timeout=0, count=1)
