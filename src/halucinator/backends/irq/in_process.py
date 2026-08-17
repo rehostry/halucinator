@@ -46,8 +46,18 @@ class InProcessIrqMixin:
     # is then executed as a branch to an unmapped address. Match bits 31:5
     # instead, which is what the architecture defines.
     _EXC_RETURN_THREAD_MSP = 0xFFFFFFF9
-    _EXC_RETURN_MASK = 0xFFFFFFE0
-    _EXC_RETURN_MAGIC = 0xFFFFFFE0
+    # Bits[31:7], which is what the architecture defines -- NOT bits[31:5].
+    # ARMv8-M adds bit 6 = S (secure) and bit 5 = DCRS *below* the v7-M flag
+    # bits, so a default non-secure thread return of 0xFFFFFFBC falls outside a
+    # 0xFFFFFFE0 window. It is then not recognised as an exception return, the
+    # ISR's `bx lr` executes as an ordinary branch to 0xFFFFFFBC, and the core
+    # faults there forever -- silently, with booted still true, because the
+    # host-side seam binds regardless of the guest. Measured on
+    # device-golioth-nrf9160: 1.8 GB of `CPU exception 3 at pc=0xffffffbc` in
+    # four minutes, versus a clean landing with these two constants widened.
+    # This window is a strict superset of the v7-M one, so v7-M is unaffected.
+    _EXC_RETURN_MASK = 0xFFFFFF80
+    _EXC_RETURN_MAGIC = 0xFFFFFF80
 
     def _decode_exc_return_frame(self, pc: int):
         """If *pc* is a Cortex-M EXC_RETURN magic value, read and unpack the
