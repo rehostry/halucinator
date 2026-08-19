@@ -647,6 +647,12 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         self._m68k_pending_ccr: Optional[tuple] = None
         self._m68k_ctx_stack: List[Any] = []
 
+        # A-profile ARM svc -> vector entry (see _intr_hook). Opt-in.
+        self._arm_svc_entry: bool = os.environ.get("HAL_ARM_SVC_ENTRY") == "1"
+        self._arm_vector_base: int = int(
+            os.environ.get("HAL_ARM_VECTOR_BASE", "0"), 0)
+        self._arm_svc_count: int = 0
+
         # Opt-in: skip an unhandled SVC instruction (advance past it and
         # zero r0) instead of aborting. Used to
         # tolerate fuzz-harness hypercalls baked into instrumented binaries
@@ -1507,6 +1513,36 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         if (self.arch_name == "cortex-m3" and not self.skip_svc
                 and pc not in (-1, 0)
                 and self._maybe_handle_cortexm_svc(uc, pc)):
+            return
+        # A-profile ARM `svc` (supervisor call). unicorn/QEMU raises EXCP_SWI
+        # out to this hook and never performs the architectural exception
+        # entry, so an RTOS whose kernel services are reached through `svc`
+        # (APC AOS on the Renesas RZ/N1 is one: every syscall stub is
+        # `push {r7}; movw/movt r7,<svc id>; svc 0`) dies on its FIRST syscall
+        # with UC_ERR_EXCEPTION. Synthesise the entry the CPU would have made:
+        #   LR_svc  = return address (unicorn already advanced PC past the svc)
+        #   SPSR_svc= CPSR at the time of the call (carries the T bit, so the
+        #             firmware's own `rfe`/`movs pc,lr` returns to Thumb)
+        #   CPSR    = SVC mode (0b10011), I=1, T=0
+        #   PC      = vector_base + 0x08
+        # Writing CPSR first is what banks SP/LR/SPSR in unicorn, so the mode
+        # switch MUST precede the LR/SPSR writes (same ordering rule as the
+        # IRQ path in backends/irq/delivery.py).
+        # Opt-in (HAL_ARM_SVC_ENTRY=1 plus HAL_ARM_VECTOR_BASE) so no existing
+        # device changes behaviour.
+        if (self.arch_name == "arm" and intno == 2
+                and self._arm_svc_entry and pc not in (-1, 0)):
+            cpsr = self.read_register("cpsr")
+            vbar = self._arm_vector_base
+            self.write_register("cpsr", (cpsr & ~0x3F) | 0x13 | 0x80)
+            self.write_register("lr", pc & 0xFFFFFFFF)
+            self.write_register("spsr", cpsr)
+            self.write_register("pc", (vbar + 0x08) & 0xFFFFFFFF)
+            self._arm_svc_count += 1
+            if self._arm_svc_count <= 4:
+                log.info("UnicornBackend: ARM svc entry #%d from 0x%08x -> "
+                         "0x%08x (SPSR=0x%08x)", self._arm_svc_count, pc,
+                         vbar + 0x08, cpsr)
             return
         # Opt-in recovery: a Thumb SVC (high byte 0xDF) from instrumented
         # firmware (e.g. P2IM aflCall). When the SVC traps, unicorn reports
