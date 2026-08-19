@@ -933,6 +933,10 @@ class M68KHalMixin(_ABIBase):
 ABI_MIXINS: Dict[str, type] = {
     "cortex-m3": ARM32HalMixin,
     "arm":       ARM32HalMixin,
+    # BE32 ARM (NET+ARM / NS7520). Endianness is a data-layout property, not
+    # an ABI one -- same AAPCS r0-r3 argument registers, same lr -- so the
+    # ARM32 mixin serves both, exactly as MIPSHalMixin serves mips/mipsel.
+    "armbe":     ARM32HalMixin,
     "arm64":     ARM64HalMixin,
     "mips":      MIPSHalMixin,
     # Little-endian MIPS32 shares the o32 calling convention with big-endian

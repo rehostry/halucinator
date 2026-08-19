@@ -88,6 +88,7 @@ _DEFAULTS: Dict[str, Optional[IrqControllerSpec]] = {
     "mips":      IrqControllerSpec(type="mips"),
     # arm / arm64 / powerpc / ppc64 — no default; user must specify.
     "arm":       None,
+    "armbe":     None,
     "arm64":     None,
     "powerpc":   None,
     "ppc64":     None,

@@ -43,6 +43,7 @@ except ImportError:
 _LANGUAGE_MAP: Dict[str, str] = {
     "cortex-m3":      "ARM:LE:32:Cortex",
     "arm":            "ARM:LE:32:v7",
+    "armbe":          "ARM:BE:32:v7",
     "arm64":          "AARCH64:LE:64:v8A",
     "mips":           "MIPS:BE:32:default",
     "powerpc":        "PowerPC:BE:32:default",

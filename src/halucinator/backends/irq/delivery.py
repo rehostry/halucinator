@@ -586,6 +586,13 @@ class X86ExceptionDeliverer(ExceptionDeliverer):
 
 _DELIVERER_CLASSES = {
     "arm": ArmExceptionDeliverer,
+    # BE32 ARM takes exceptions exactly like LE ARM (same vector table, same
+    # CPSR mode switch, same lr offsets); only the byte order of memory
+    # differs, and the deliverer writes through the backend's byte-order-aware
+    # write_memory(). Without this row build_exception_deliverer() returns
+    # None for `armbe` and every abort loops forever (playbook: "unicorn never
+    # performs ARM exception entry").
+    "armbe": ArmExceptionDeliverer,
     "arm64": Arm64ExceptionDeliverer,
     "mips": ShadowExceptionDeliverer,
     "powerpc": ShadowExceptionDeliverer,

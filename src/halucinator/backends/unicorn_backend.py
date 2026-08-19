@@ -122,6 +122,20 @@ _ARCH_MAP: Dict[str, Tuple[str, str, bool, bool, int]] = {
     # UC_ERR_MODE (there is no little-endian SPARC32 CPU in its QEMU core), so
     # the endianness flag is not optional here the way it is for MIPS.
     "sparc":          ("sparc",  "sparc32_be", False, True, 4),
+    # 32-bit A-profile ARM in the BE32 byte order -- NetSilicon NET+ARM
+    # (NS7520/NS9xxx), IXP4xx, and most 2000s device servers ran their ARM
+    # cores big-endian. unicorn 2.1.4 supports it: UC_MODE_ARM |
+    # UC_MODE_BIG_ENDIAN decodes instructions big-endian AND serves loads
+    # big-endian (measured: `ldr` over the bytes AA BB CC DD returns
+    # 0xAABBCCDD, `ldrh` 0xAABB, `ldrb` 0xAA).
+    #
+    # This is an ENDIANNESS VARIANT of "arm", not a separate ISA: same
+    # register map, same AAPCS argument passing, same exception model, same
+    # `mov pc,rX` / abort-delivery quirks. So `armbe` is normalised to "arm"
+    # inside UnicornBackend.__init__ after the endianness is recorded --
+    # see the _arm_big_endian comment there for why a parallel arch key
+    # would be a silent-failure machine.
+    "armbe":          ("arm",    "arm_be",  False, True,  4),
 }
 
 _PERM_MAP = {
@@ -516,6 +530,20 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                 "Install it with: pip install unicorn"
             )
         self.config = config
+        # "armbe" == 32-bit A-profile ARM, BE32 byte order. Endianness is a
+        # data-layout property; it changes neither the register map, the ABI,
+        # the exception model nor any of the ARM-specific workarounds in this
+        # file. A parallel arch key would therefore have to be added to
+        # ABI_MIXINS, _DELIVERER_CLASSES, the IRQ default table, the ghidra
+        # language map, _reg_map_for_arch AND every `self.arch_name == "arm"`
+        # fast path below (CPU model pin, `mov pc,rX` emulation, bad-call
+        # recovery, MMU flat fallback, the irq_chunk gate, the CPSR reset,
+        # inject_irq's two routing tables) -- and MISSING one fails silently,
+        # which is the failure mode this fleet has been bitten by most.
+        # So: record the endianness, then run as "arm".
+        self._arm_big_endian = (arch == "armbe")
+        if self._arm_big_endian:
+            arch = "arm"
         self.arch_name = arch
         # Breakpoint keys drop bit 0 because on 32-bit ARM that bit is the
         # Thumb interworking flag, not part of the address -- a bp requested at
@@ -676,6 +704,12 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         # Cache arch traits from _ARCH_MAP for hot paths (cont/read_memory).
         info = _ARCH_MAP.get(arch, ("arm", "thumb", True, False, 4))
         _, _, self._is_thumb, self._is_be, self._word_size = info
+        # `arch` has already been normalised armbe -> arm, whose _ARCH_MAP row
+        # says little-endian. Re-assert the real byte order here or every
+        # modelled-MMIO read, read_memory() and write_memory() on a BE32 ARM
+        # target would be byte-swapped (playbook trap 37, the SPARC/MIPS-BE bug).
+        if self._arm_big_endian:
+            self._is_be = True
 
         # Bind the arch-specific ABI mixin onto the instance (ARM32 stays the
         # default via inheritance so existing arm/cortex-m callers are
@@ -707,6 +741,11 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                 if mode_str == "thumb"
                 else unicorn.UC_MODE_ARM
             )
+            # BE32 ARM (NET+ARM / NS7520 and friends). Unlike SPARC, the flag
+            # is a genuine refinement here: unicorn accepts a bare
+            # UC_MODE_ARM, it just runs it little-endian.
+            if self._arm_big_endian:
+                uc_mode |= unicorn.UC_MODE_BIG_ENDIAN
         elif arch_str == "arm64":
             uc_arch = unicorn.UC_ARCH_ARM64
             uc_mode = unicorn.UC_MODE_ARM
@@ -1184,7 +1223,8 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                     insn_bytes = uc.mem_read(addr, 4)
                 except Exception:
                     return
-                w = int.from_bytes(insn_bytes, "little")
+                w = int.from_bytes(
+                    insn_bytes, "big" if self._is_be else "little")
                 # ARM bl: cond=any, opcode=0xb (bl), 24-bit signed offset
                 cond = (w >> 28) & 0xf
                 opc = (w >> 24) & 0xf
@@ -1224,7 +1264,8 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                     insn_bytes = uc.mem_read(addr, 4)
                 except Exception:
                     return
-                w = int.from_bytes(insn_bytes, "little")
+                w = int.from_bytes(
+                    insn_bytes, "big" if self._is_be else "little")
                 # mov pc, Rn: 0xe1a0f00n (n = 0..14, cond=e)
                 # bx Rn:      0xe12fff1n
                 if (w & 0xffffff00) == 0xe1a0f000 or (w & 0xfffffff0) == 0xe12fff10:
@@ -1299,7 +1340,10 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                     for pa, pv in pins.items():
                         if addr <= pa < addr + size or pa <= addr < pa + 4:
                             try:
-                                uc.mem_write(pa, pv.to_bytes(4, "little"))
+                                uc.mem_write(
+                                    pa,
+                                    pv.to_bytes(
+                                        4, "big" if self._is_be else "little"))
                             except Exception:
                                 pass
                 self._uc.hook_add(unicorn.UC_HOOK_MEM_READ, _pin_read,
@@ -1568,7 +1612,12 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         if (self._emulate_pc_write and self.arch_name == "arm"
                 and pc not in (-1, 0)):
             try:
-                instr = int.from_bytes(bytes(uc.mem_read(pc, 4)), "little")
+                # ARM instruction word in the GUEST's byte order: on BE32
+                # ARM a "little" read makes every `mov pc,Rm` fail the mask
+                # and the recovery silently never fires.
+                instr = int.from_bytes(
+                    bytes(uc.mem_read(pc, 4)),
+                    "big" if self._is_be else "little")
             except Exception:  # noqa: BLE001
                 instr = 0
             if (instr & 0x0FFFFFF0) == 0x01A0F000:   # mov{cond} pc, Rm
@@ -1729,14 +1778,18 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         rid = self._arm_reg_id(cs.reg_name(reg_op.reg))
         if rid is None:
             return False
+        # Guest byte order, not host: this path hand-completes an ARM load or
+        # store, and on a BE32 ARM target a hardcoded "little" silently
+        # byte-reverses every word it touches.
+        _order = "big" if self._is_be else "little"
         if is_load:
-            val = int.from_bytes(data, "little")
+            val = int.from_bytes(data, _order)
             if signed and (val & (1 << (size * 8 - 1))):
                 val -= 1 << (size * 8)
             uc.reg_write(rid, val & 0xFFFFFFFF)
         else:
             val = uc.reg_read(rid) & ((1 << (size * 8)) - 1)
-            uc.mem_write(addr, val.to_bytes(size, "little"))
+            uc.mem_write(addr, val.to_bytes(size, _order))
         # Pre/post-indexed writeback updates the base register with `addr`
         # (pre) — capstone exposes writeback via ins.writeback.
         if getattr(ins, "writeback", False):
@@ -3686,7 +3739,9 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
             else:
                 val = _GICV2_SPURIOUS
             try:
-                uc.mem_write(addr, val.to_bytes(size, "little"))
+                uc.mem_write(
+                    addr,
+                    val.to_bytes(size, "big" if self._is_be else "little"))
             except Exception:  # noqa: BLE001
                 pass
 

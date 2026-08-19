@@ -65,6 +65,26 @@ def _get_halucinator_targets() -> Dict[str, Dict[str, Any]]:
                 _QEMU_DEFAULT_LOC, "arm-softmmu/qemu-system-arm"
             ),
         },
+        # BE32 ARM ("armbe"): 32-bit A-profile ARM running big-endian, as
+        # NetSilicon NET+ARM (NS7520/NS9xxx), IXP4xx and most 2000s
+        # device-server SoCs did. Runs on the in-process unicorn backend, which
+        # reads the endianness from its own arch table; this entry exists so
+        # HalConfig's `arch not in HALUCINATOR_TARGETS` validation accepts the
+        # config. avatar_arch is the little-endian ARM object deliberately
+        # NOT reused -- an avatar2/qemu run would boot the wrong byte order
+        # silently -- so it is None and those paths fail loudly.
+        "armbe": {
+            "avatar_arch": None,
+            "qemu_target": lambda: (_ for _ in ()).throw(
+                NotImplementedError(
+                    "armbe (big-endian ARM32) runs on the in-process unicorn "
+                    "backend only (--emulator unicorn); this fleet ships no "
+                    "armeb-softmmu QEMU")),
+            "qemu_env_var": "HALUCINATOR_QEMU_ARMEB",
+            "qemu_default_path": os.path.join(
+                _QEMU_DEFAULT_LOC, "armeb-softmmu/qemu-system-armeb"
+            ),
+        },
         "arm64": {
             "avatar_arch": ARM64,
             "qemu_target": lambda: _qemu_target("ARM64QemuTarget"),
