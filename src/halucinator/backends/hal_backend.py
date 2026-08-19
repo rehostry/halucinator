@@ -544,6 +544,63 @@ class ARM64HalMixin(_ABIBase):
         self.cont()
 
 
+class RISCV64HalMixin(_ABIBase):
+    """
+    RV64 LP64/LP64D ABI: args in a0-a7 (x10-x17) then stack, return addr in ra
+    (x1), return value in a0 (x10). x0 is the hardwired-zero register.
+
+    Deliberately NOT a subclass of RISCVHalMixin, and deliberately not shared
+    with it. The register names and the argument registers are identical, but
+    three things are width-dependent and RISCVHalMixin has all three wired for
+    RV32:
+
+      * WORD_SIZE feeds unicorn_backend's `until` sentinel
+        `(1 << word_size*8) - 1`. At 4 that is 0xFFFFFFFF -- an ordinary
+        address inside a 64-bit map, so every cont() would stop silently at a
+        real instruction instead of running to the intended breakpoint.
+      * the stacked-argument stride is the XLEN slot size: 8 on LP64, not 4.
+      * execute_return masks the return value to XLEN. Masking to 32 bits on
+        RV64 truncates any pointer or 64-bit result above 4 GB and, worse,
+        drops the sign extension RV64 callers expect from an int return.
+    """
+    WORD_SIZE = 8
+    REGISTERS = (
+        "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+        "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+        "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
+        "t3", "t4", "t5", "t6", "pc",
+    )
+
+    def get_arg(self, idx: int) -> int:
+        if idx < 0:
+            raise ValueError(f"Argument index must be non-negative, got {idx}")
+        if idx < 8:
+            return self.read_register(f"a{idx}")
+        sp = self.read_register("sp")
+        return self.read_memory(sp + (idx - 8) * 8, 8, 1)
+
+    def set_args(self, args: List[int]) -> None:
+        for i, v in enumerate(args[:8]):
+            self.write_register(f"a{i}", v)
+        if len(args) > 8:
+            sp = self.read_register("sp")
+            for i, v in enumerate(args[8:]):
+                self.write_memory(sp + i * 8, 8, v)
+
+    def get_ret_addr(self) -> int:
+        return self.read_register("ra")
+
+    def set_ret_addr(self, ret_addr: int) -> None:
+        self.write_register("ra", ret_addr)
+
+    def execute_return(self, ret_value: int) -> None:
+        regs = {"pc": self.read_register("ra")}
+        if ret_value is not None:
+            regs["a0"] = ret_value & 0xFFFFFFFFFFFFFFFF
+        self.write_registers(regs)
+        self.cont()
+
+
 class MIPSHalMixin(_ABIBase):
     """
     MIPS32 O32 ABI: args in a0–a3 then stack, return addr in ra,
@@ -951,6 +1008,10 @@ ABI_MIXINS: Dict[str, type] = {
     "ppc64":     PowerPC64HalMixin,
     "x86":       X86HalMixin,
     "riscv32":   RISCVHalMixin,
+    # Without this entry _bind_abi falls back to ARM32HalMixin *silently* (the
+    # fallback IS the default, so the rebinding branch never runs) and the
+    # first intercept to read an argument dies with "Unknown register: 'r0'".
+    "riscv64":   RISCV64HalMixin,
     "tricore":   TriCoreHalMixin,
     # Without this entry _bind_abi falls back to ARM32HalMixin *silently* --
     # the fallback IS the default, so the rebinding branch never runs -- and

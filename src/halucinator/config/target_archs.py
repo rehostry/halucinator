@@ -187,6 +187,24 @@ def _get_halucinator_targets() -> Dict[str, Dict[str, Any]]:
                 _QEMU_DEFAULT_LOC, "riscv32-softmmu/qemu-system-riscv32"
             ),
         },
+        # RV64GC (RISC-V, 64-bit, little-endian): Kendryte K210 and the rest of
+        # the 64-bit RISC-V embedded SoCs. Same in-process-unicorn-only story as
+        # riscv32 above -- avatar2 has no RISC-V arch and the fleet's qemu build
+        # ships no riscv64-softmmu, so avatar_arch is None and the qemu_target
+        # lambda is a tripwire that the unicorn path never invokes. Registered
+        # here so HalConfig's `arch not in HALUCINATOR_TARGETS` validation
+        # accepts the config.
+        "riscv64": {
+            "avatar_arch": None,
+            "qemu_target": lambda: (_ for _ in ()).throw(
+                NotImplementedError(
+                    "riscv64 runs on the in-process unicorn backend only "
+                    "(--emulator unicorn); no avatar2/qemu RISC-V target")),
+            "qemu_env_var": "HALUCINATOR_QEMU_RISCV64",
+            "qemu_default_path": os.path.join(
+                _QEMU_DEFAULT_LOC, "riscv64-softmmu/qemu-system-riscv64"
+            ),
+        },
         # Infineon TriCore (AURIX TC2xx/TC3xx). In-process (unicorn) only:
         # avatar2 has no TriCore arch, and there is no tricore-softmmu QEMU in
         # the deps build, so `avatar_arch`/`qemu_target` stay None. The entry

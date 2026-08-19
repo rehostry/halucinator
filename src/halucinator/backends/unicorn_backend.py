@@ -117,6 +117,20 @@ _ARCH_MAP: Dict[str, Tuple[str, str, bool, bool, int]] = {
     # I/M/A/C extensions + Zicsr with no CPU-model pin; bare-metal images link
     # at DRAM base 0x8000_0000. No thumb, little-endian, 4-byte words.
     "riscv32":        ("riscv",  "riscv32_le", False, False, 4),
+    # RV64GC (RISC-V, 64-bit, little-endian) -- Kendryte K210, SiFive U-series,
+    # and every 64-bit RISC-V SoC. Measured on unicorn 2.1.4: the RV64-only
+    # opcodes all decode (sd/ld, the *W forms, mul/divu/remw, amoadd.d,
+    # lr.d/sc.d, fmv.d.x/fadd.d/fcvt.l.d, and the RV64-only compressed c.sd/
+    # c.ld/c.addiw), and the whole M/S/U CSR file is reachable through
+    # reg_read/reg_write.
+    #
+    # word_size is 8, which is both the LP64 pointer size AND the width of the
+    # `until` sentinel `(1 << word_size*8) - 1` that cont()/step() pass to
+    # emu_start. 0xFFFF_FFFF_FFFF_FFFF is accepted by unicorn and is not a
+    # mappable address here, so unlike the x86-16 case there is no sentinel/
+    # real-address collision. Do NOT set it to 4: that would make the sentinel
+    # 0xFFFFFFFF, an ordinary address in a 64-bit map.
+    "riscv64":        ("riscv",  "riscv64_le", False, False, 8),
     # Motorola 68000 family, BIG-endian. Covers both ColdFire (MCF5206/5208/
     # V4e -- the embedded line) and the classic 68000/020/040/060, selected at
     # run time by HAL_M68K_CPU_MODEL; see init(). 4-byte words, no thumb.
@@ -1775,9 +1789,95 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                 return  # MMU now off -> faulting instr re-executes flat
             if intno == 4 and self._mmu_flat_complete(uc, pc):
                 return
+        # RISC-V (rv32 / rv64): unicorn fires this hook for `ecall` and for
+        # illegal instructions but performs NO architectural trap entry --
+        # mepc / mcause / mtval / mstatus are left untouched and, if the hook
+        # returns without stopping, execution simply falls through to the next
+        # instruction. That fall-through is the dangerous half: a firmware
+        # whose newlib stubs are `ecall`s would silently run on with a garbage
+        # a0 instead of the syscall's result. Synthesise the entry (RISC-V
+        # priv spec 3.1.6 / 3.1.14) so the firmware's OWN mtvec handler runs;
+        # the RETURN side needs nothing, because unicorn executes `mret`
+        # natively and restores pc from mepc and mstatus.MIE from MPIE
+        # (measured on 2.1.4).
+        if (self.arch_name in ("riscv32", "riscv64")
+                and not os.environ.get("HAL_RISCV_NO_TRAP")):
+            if self._riscv_deliver_trap(uc, intno, pc):
+                return
         log.error("UnicornBackend: CPU exception/interrupt %d at pc=0x%x",
                   intno, pc)
         uc.emu_stop()
+
+    # RISC-V exception causes (priv spec table 3.6), the subset unicorn raises.
+    _RISCV_CAUSE_ILLEGAL = 2
+    _RISCV_CAUSE_BREAKPOINT = 3
+    _RISCV_CAUSE_ECALL_U = 8
+    _RISCV_CAUSE_ECALL_M = 11
+
+    def _riscv_deliver_trap(self, uc, intno, pc) -> bool:
+        """Synthesise RISC-V M-mode trap entry. Returns True if delivered.
+
+        Three things here are measured, not assumed, and each is silent when
+        wrong:
+
+        * **unicorn reports pc as the address AFTER the trapping instruction.**
+          RISC-V `mepc` must hold the address OF it, because handlers advance
+          it themselves (the kendryte SDK's `handle_syscall` does `epc += 4`).
+          Setting mepc to the reported pc makes every syscall return one
+          instruction too far -- into the middle of the caller.
+        * **unicorn reports `ecall` as intno 8 (U_ECALL) whatever the current
+          privilege.** It exposes no writable `priv` register and these images
+          run entirely in M-mode, so the architecturally correct mcause is 11
+          (ECALL from M), not 8. A handler that switches on mcause would take
+          the wrong arm.
+        * **`ebreak` does NOT arrive here at all** -- unicorn 2.1.4 reports it
+          as UC_ERR_INSN_INVALID (errno 10) with no INTR hook firing, so it
+          cannot be delivered from this path.
+
+        `HAL_RISCV_NO_TRAP=1` disables delivery, which is the falsification
+        knob: with it set, an `ecall` firmware stops at the old
+        "CPU exception/interrupt" error instead of running its handler.
+        """
+        if riscv_const is None or pc in (-1, 0):
+            return False
+        if intno == self._RISCV_CAUSE_ECALL_U:
+            cause = self._RISCV_CAUSE_ECALL_M
+        elif intno in (self._RISCV_CAUSE_ILLEGAL, self._RISCV_CAUSE_BREAKPOINT):
+            cause = intno
+        else:
+            # An interrupt cause (bit 63/31 set) or something unicorn does not
+            # document. Refuse rather than guess -- the caller then logs and
+            # stops, which is loud.
+            return False
+        try:
+            mtvec = uc.reg_read(riscv_const.UC_RISCV_REG_MTVEC)
+        except Exception:  # noqa: BLE001
+            return False
+        base = mtvec & ~0x3
+        if base == 0:
+            # mtvec unset: the firmware has installed no handler, so entering
+            # at 0 would be a fabricated crash. Let the caller stop instead.
+            return False
+        # ecall is always a 4-byte instruction; illegal-instruction traps
+        # report the instruction itself, not the one after it.
+        epc = (pc - 4) if cause == self._RISCV_CAUSE_ECALL_M else pc
+        mstatus = uc.reg_read(riscv_const.UC_RISCV_REG_MSTATUS)
+        mie = (mstatus >> 3) & 1
+        # MIE <- 0, MPIE <- MIE, MPP <- 3 (M-mode; unicorn has no writable
+        # privilege register, so the interrupted privilege is always M here).
+        mstatus = (mstatus & ~((1 << 3) | (1 << 7) | (3 << 11))) \
+            | (mie << 7) | (3 << 11)
+        uc.reg_write(riscv_const.UC_RISCV_REG_MEPC, epc)
+        uc.reg_write(riscv_const.UC_RISCV_REG_MCAUSE, cause)
+        uc.reg_write(riscv_const.UC_RISCV_REG_MTVAL, 0)
+        uc.reg_write(riscv_const.UC_RISCV_REG_MSTATUS, mstatus)
+        uc.reg_write(riscv_const.UC_RISCV_REG_PC, base)
+        self._riscv_traps = getattr(self, "_riscv_traps", 0) + 1
+        if self._riscv_traps <= 8 or self._riscv_traps % 10000 == 0:
+            log.info("UnicornBackend: riscv trap intno=%d -> mcause=%d "
+                     "mepc=0x%x mtvec=0x%x (#%d)",
+                     intno, cause, epc, base, self._riscv_traps)
+        return True
 
     def _mmu_disable(self, uc) -> bool:
         """Clear SCTLR.M (and TLB-relevant bits) to turn off ARM MMU
