@@ -99,6 +99,20 @@ _ARCH_MAP: Dict[str, Tuple[str, str, bool, bool, int]] = {
     "powerpc:MPC8XX": ("ppc",    "ppc32_be", False, True, 4),
     "ppc64":          ("ppc",    "ppc64_be", False, True, 8),
     "x86":            ("x86",    "x86_32",   False, False, 4),
+    # x86 16-bit REAL MODE (Lantronix DSTni-EX, 80186-class embedded
+    # SoCs, MS-DOS images). Segmented: the linear address a hook/
+    # breakpoint/emu_start sees is CS.base + IP, and CS.base = CS<<4.
+    # Unicorn's x86 API is LINEAR throughout (emu_start begin/until,
+    # HOOK_CODE addr, mem_read/write, mmio_map) -- measured on unicorn
+    # 2.1.4 -- so the flat-address core works unchanged EXCEPT for the
+    # PC register, which unicorn exposes as the *offset* EIP. See
+    # read_register()/write_register() for the linearisation.
+    #
+    # word_size stays 4 ON PURPOSE. cont()/step() derive the emu_start
+    # `until` sentinel as (1 << word_size*8) - 1; with word_size=2 that
+    # is 0xFFFF, a perfectly ordinary linear address in a 1 MB real-mode
+    # map, and every run would halt there silently.
+    "x86-16":         ("x86",    "x86_16",   False, False, 4),
     # RV32IMAC (RISC-V, 32-bit, little-endian). unicorn decodes the base
     # I/M/A/C extensions + Zicsr with no CPU-model pin; bare-metal images link
     # at DRAM base 0x8000_0000. No thumb, little-endian, 4-byte words.
@@ -395,12 +409,21 @@ def _get_x86_reg_map() -> Dict[str, int]:
     if x86_const is None:
         return {}
     names = ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
-             "eip", "eflags", "cs", "ds", "es", "fs", "gs", "ss")
+             "eip", "eflags", "cs", "ds", "es", "fs", "gs", "ss",
+             # 16-bit and 8-bit views. Real-mode firmware (and the intercepts
+             # written against it) work in ax/bx/si/di/sp/bp and al/ah; without
+             # these an intercept has to mask the 32-bit view by hand and a
+             # write silently clobbers the (nonexistent) high half.
+             "ax", "bx", "cx", "dx", "si", "di", "bp", "sp16", "ip", "flags",
+             "al", "ah", "bl", "bh", "cl", "ch", "dl", "dh")
     m: Dict[str, int] = {}
     for name in names:
         v = getattr(x86_const, f"UC_X86_REG_{name.upper()}", None)
         if v is not None:
             m[name] = v
+    # UC_X86_REG_SP is the 16-bit stack pointer; it must not win the "sp"
+    # name below (halucinator's generic code wants the full register).
+    m.pop("sp16", None)
     # halucinator's generic code (dispatch loop, regs.pc, MMIO pc capture)
     # uses the architecture-neutral names "pc" and "sp".
     if "eip" in m:
@@ -558,7 +581,10 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         # instructions at `a` and `a|1` collapsed onto one key, firing the same
         # handler on both. In HAL_FAST_BP mode the range hook is bounded by the
         # masked address as well, so the intended PC is never even hooked.
-        self._bp_addr_mask = 0xFFFFFFFF if arch == "x86" else 0xFFFFFFFE
+        # x86 in EITHER width has byte-aligned instructions.
+        self._x86 = arch in ("x86", "x86-16")
+        self._x86_16 = arch == "x86-16"
+        self._bp_addr_mask = 0xFFFFFFFF if self._x86 else 0xFFFFFFFE
         self._uc: Optional[Any] = None           # unicorn.Uc instance
         self._regions: List[MemoryRegion] = []
         self._bp_hooks: Dict[int, Tuple[int, Any]] = {}  # bp_id → (addr, hook_h)
@@ -764,7 +790,8 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                 uc_mode = unicorn.UC_MODE_PPC32 | unicorn.UC_MODE_BIG_ENDIAN
         elif arch_str == "x86":
             uc_arch = unicorn.UC_ARCH_X86
-            uc_mode = unicorn.UC_MODE_32
+            uc_mode = (unicorn.UC_MODE_16 if mode_str == "x86_16"
+                       else unicorn.UC_MODE_32)
         elif arch_str == "riscv":
             uc_arch = unicorn.UC_ARCH_RISCV
             # RV64 would be UC_MODE_RISCV64; only RV32 is wired today. RISC-V is
@@ -795,6 +822,33 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
 
         self._uc = unicorn.Uc(uc_arch, uc_mode)
         log.info("Unicorn engine initialised: arch=%s mode=%s", arch_str, mode_str)
+
+        # x86-16: the reset segment state is part of the machine description,
+        # not of the image. HAL_X86_INIT_SEGS="cs=0xF000,ds=0,ss=0,sp=0xFFFE"
+        # applies it before the entry PC is written, so a `pc:` in the config
+        # that lies inside that CS resolves without the re-segmentation
+        # fallback in write_register(). Accepts cs/ds/es/fs/gs/ss/sp.
+        if self._x86_16:
+            import os as _os
+            _segs = _os.environ.get("HAL_X86_INIT_SEGS", "")
+            for _tok in (t.strip() for t in _segs.split(",") if t.strip()):
+                if "=" not in _tok:
+                    hlog.warning("HAL_X86_INIT_SEGS: ignoring %r", _tok)
+                    continue
+                _n, _v = _tok.split("=", 1)
+                _n = _n.strip().lower()
+                if _n not in ("cs", "ds", "es", "fs", "gs", "ss", "sp"):
+                    hlog.warning("HAL_X86_INIT_SEGS: unknown register %r", _n)
+                    continue
+                try:
+                    _val = int(_v, 0) & 0xFFFF
+                except ValueError:
+                    hlog.warning("HAL_X86_INIT_SEGS: bad value %r for %s",
+                                 _v, _n)
+                    continue
+                self._uc.reg_write(
+                    self._reg_map["esp" if _n == "sp" else _n], _val)
+                hlog.info("HAL_X86_INIT_SEGS: %s = 0x%04x", _n, _val)
 
         # Cortex-M kernels (Zephyr, FreeRTOS, MCUXpresso) use `msr/mrs` to
         # special-purpose registers (PRIMASK, BASEPRI, FAULTMASK, CONTROL)
@@ -1033,7 +1087,7 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         # special-cased to report "transmitter empty + data not ready" so
         # the firmware's UART poll loops don't spin forever). This mirrors
         # the AutoPeripheral catch-all policy for MMIO.
-        if arch_str == "x86" and x86_const is not None:
+        if self._x86 and x86_const is not None:
             self._port_reads: Dict[int, int] = {}
             self._add_insn_hook(self._x86_in_hook, x86_const.UC_X86_INS_IN)
             self._add_insn_hook(self._x86_out_hook, x86_const.UC_X86_INS_OUT)
@@ -1511,6 +1565,24 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
             pc = self.read_register("pc")
         except Exception:
             pc = -1
+        # x86-16 REAL MODE: unicorn has no interrupt machinery at all here.
+        # Measured on unicorn 2.1.4: with no HOOK_INTR registered, an
+        # `int 0x21` with a perfectly valid real-mode IVT entry aborts the run
+        # with UC_ERR_EXCEPTION -- the CPU never reads the vector table. This
+        # is the same shape as the ARM abort / m68k `rte` / Cortex-M SVC gaps
+        # already handled below: unicorn raises OUT to the host instead of
+        # performing architectural exception entry, so the entry has to be
+        # synthesised here. (The RETURN side needs nothing: real-mode `iret`
+        # executes natively and pops the frame correctly -- verified.)
+        #
+        # Entry per the 8086/80186 manual: push FLAGS, CS, IP; clear IF and TF;
+        # load CS:IP from the 4-byte vector at linear intno*4. unicorn reports
+        # EIP already advanced past a software `int N` (trap semantics) and
+        # still ON the faulting instruction for a CPU fault, which is exactly
+        # what each case needs pushed, so the same code serves both.
+        if self._x86_16 and not os.environ.get("HAL_X86_NO_IVT"):
+            if self._x86_16_deliver_int(uc, intno):
+                return
         # x86: VxWorks (and most x86 kernels) reload segment selectors from
         # a GDT they build at boot — typically via a far `iretd`/`retf`/
         # `ljmp` to a flat code selector. Unicorn's x86 model has no GDT
@@ -1915,6 +1987,65 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                         buf.append(low)
                 break
         log.debug("x86 OUT port=0x%x size=%d value=0x%x", port, size, value)
+
+    # Vectors unicorn reports that are NOT real-mode interrupt vectors: QEMU's
+    # internal EXCP_* codes leak through the INTR hook with values >= 0x100
+    # (EXCP_HLT is one). A guest `hlt` in an idle loop must not be dispatched
+    # through IVT[0x01] -- that would vector into whatever the firmware put in
+    # the single-step slot.
+    _X86_MAX_VECTOR = 0xFF
+
+    def _x86_16_deliver_int(self, uc, intno: int) -> bool:
+        """Synthesise real-mode interrupt entry. Returns True if delivered."""
+        if intno is None or intno < 0 or intno > self._X86_MAX_VECTOR:
+            # EXCP_HLT and friends: treat as "idle until the next chunk
+            # boundary" rather than a vector. Returning True consumes the
+            # trap; cont() re-enters emu_start at the instruction after it.
+            hlog.info("UnicornBackend[x86-16]: non-vector CPU exception "
+                      "%r at pc=0x%05x -- ignored (idle/halt)",
+                      intno, self.read_register("pc"))
+            return True
+        try:
+            rm = self._reg_map
+            cs = uc.reg_read(rm["cs"]) & 0xFFFF
+            ip = uc.reg_read(rm["eip"]) & 0xFFFF
+            fl = uc.reg_read(rm["eflags"]) & 0xFFFF
+            ss = uc.reg_read(rm["ss"]) & 0xFFFF
+            sp = uc.reg_read(rm["esp"]) & 0xFFFF
+            # Read the vector FIRST: an unprogrammed slot (all zeroes, or the
+            # 0xFFFF:0xFFFF of erased flash) means the firmware never installed
+            # a handler, and vectoring to it would bury the real fault under a
+            # second one somewhere useless. Say what happened and let the
+            # normal fault path report it.
+            vec = bytes(uc.mem_read(intno * 4, 4))
+            new_ip = int.from_bytes(vec[0:2], "little")
+            new_cs = int.from_bytes(vec[2:4], "little")
+            if (new_cs, new_ip) in ((0x0000, 0x0000), (0xFFFF, 0xFFFF)):
+                hlog.warning("UnicornBackend[x86-16]: int 0x%02x from "
+                             "%04x:%04x has an UNPROGRAMMED IVT entry "
+                             "(%04x:%04x) -- not delivering",
+                             intno, cs, ip, new_cs, new_ip)
+                return False
+            ss_base = ss << 4
+            for word in (fl, cs, ip):
+                sp = (sp - 2) & 0xFFFF
+                uc.mem_write(ss_base + sp, int(word).to_bytes(2, "little"))
+            uc.reg_write(rm["esp"], sp)
+            uc.reg_write(rm["eflags"], fl & ~0x0300)   # clear IF (9) and TF (8)
+            uc.reg_write(rm["cs"], new_cs)
+            uc.reg_write(rm["eip"], new_ip)
+            log.debug("x86-16: int 0x%02x  %04x:%04x -> %04x:%04x (sp=0x%04x)",
+                      intno, cs, ip, new_cs, new_ip, sp)
+            # PC/SP have moved: stop the run so cont() re-enters emu_start at
+            # the (linear) handler address. Mutating PC inside a hook and
+            # letting the current emu_start continue is exactly the case
+            # unicorn discards on unwind.
+            uc.emu_stop()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.error("x86-16: interrupt delivery for vector 0x%02x failed: %s",
+                      intno, exc)
+            return False
 
     def _x86_handle_seg_fault(self, uc, pc: int) -> bool:
         """Flat-segmentation recovery for an x86 #GP at a segment-changing
@@ -2751,16 +2882,68 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
     # Registers
     # ------------------------------------------------------------------
 
+    # -- x86 real-mode PC linearisation ---------------------------------
+    #
+    # In 16-bit real mode the CPU's program counter is a PAIR: CS:IP, and the
+    # address every OTHER part of unicorn speaks is the linear CS.base + IP
+    # (CS.base == CS << 4). Measured on unicorn 2.1.4:
+    #
+    #   * HOOK_CODE / HOOK_MEM / mmio_map report LINEAR addresses;
+    #   * emu_start(begin, until) takes LINEAR addresses -- internally it does
+    #     eip = (begin - CS.base) & 0xFFFF;
+    #   * uc.reg_read(UC_X86_REG_EIP) returns the OFFSET.
+    #
+    # halucinator is a flat-address core: cont() does
+    # `emu_start(read_register("pc"), ...)` every chunk, breakpoints are keyed
+    # on the HOOK_CODE address, and _bp_hit_addr comes from read_register("pc").
+    # Handing back the offset therefore mixes the two address spaces. It is not
+    # a benign off-by-base either -- it silently executes the WRONG CODE:
+    # with CS=0x1234 (base 0x12340) and the guest stopped at linear 0x12345,
+    # resuming at the offset 0x0005 gives eip = (5 - 0x12340) & 0xFFFF = 0xDCC5
+    # and the CPU runs at linear 0x20005. No error, no diagnostic.
+    #
+    # So "pc" is a VIRTUAL register on this arch: reads linearise, writes
+    # de-linearise against the current CS. Everything else (sp, the GPRs, the
+    # segment registers themselves) is passed through untouched -- sp is an
+    # offset into SS by definition and must stay one.
+    def _x86_cs_base(self) -> int:
+        return (self._uc.reg_read(self._reg_map["cs"]) & 0xFFFF) << 4
+
     def read_register(self, register: str) -> int:
-        uc_reg = self._reg_map.get(register.lower())
+        r = register.lower()
+        uc_reg = self._reg_map.get(r)
         if uc_reg is None:
             raise ValueError(f"Unknown register: {register!r}")
-        return self._uc.reg_read(uc_reg)
+        v = self._uc.reg_read(uc_reg)
+        if self._x86_16 and r == "pc":
+            return (self._x86_cs_base() + (v & 0xFFFF)) & 0xFFFFF
+        return v
 
     def write_register(self, register: str, value: int) -> None:
-        uc_reg = self._reg_map.get(register.lower())
+        r = register.lower()
+        uc_reg = self._reg_map.get(r)
         if uc_reg is None:
             raise ValueError(f"Unknown register: {register!r}")
+        if self._x86_16 and r == "pc":
+            base = self._x86_cs_base()
+            off = (value & 0xFFFFF) - base
+            if not (0 <= off <= 0xFFFF):
+                # The requested linear address is not reachable from the
+                # current code segment. Re-seg onto the nearest paragraph so
+                # the jump lands, and SAY SO: a far target the guest would
+                # have reached with its own `ljmp` carries a CS the firmware
+                # cares about (an ISR's CS is pushed and restored by iret), and
+                # a synthesised CS is a guess. Silently truncating instead
+                # would put the CPU somewhere unrelated.
+                new_cs = (value >> 4) & 0xFFFF
+                hlog.warning("UnicornBackend[x86-16]: pc=0x%05x is outside "
+                             "CS=0x%04x (base 0x%05x); re-segmenting to "
+                             "CS=0x%04x:0x%04x", value & 0xFFFFF,
+                             base >> 4, base, new_cs, value & 0xF)
+                self._uc.reg_write(self._reg_map["cs"], new_cs)
+                off = value & 0xF
+            self._uc.reg_write(uc_reg, off & 0xFFFF)
+            return
         self._uc.reg_write(uc_reg, value)
 
     # ------------------------------------------------------------------
@@ -2882,7 +3065,7 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         _chunk_env = __os.environ.get("HAL_IRQ_CHUNK")
         if _chunk_env:
             irq_chunk = int(_chunk_env, 0)
-        elif self.arch_name in ("x86", "arm", "m68k"):
+        elif self.arch_name in ("x86", "x86-16", "arm", "m68k"):
             # m68k joins the bounded-chunk arches for the same reason: it has
             # no native exception machinery in unicorn, so every interrupt is
             # synthesised BETWEEN chunks by _apply_pending_irq_m68k. With an
