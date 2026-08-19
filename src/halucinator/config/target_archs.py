@@ -154,6 +154,21 @@ def _get_halucinator_targets() -> Dict[str, Dict[str, Any]]:
                 _QEMU_DEFAULT_LOC, "i386-softmmu/qemu-system-i386"
             ),
         },
+        # x86 16-bit REAL MODE, little-endian. In-process unicorn backend
+        # ONLY -- the avatar2/QEMU path cannot express "start this i386 target
+        # in real mode at CS:IP", so avatar_arch borrows the 32-bit X86 purely
+        # so the config validates, and nothing on the unicorn path reads it
+        # (unicorn_backend._ARCH_MAP carries the real mode). Targets:
+        # Lantronix DSTni-EX device servers, ICP DAS MS-DOS images, and other
+        # 80186-class embedded SoCs.
+        "x86-16": {
+            "avatar_arch": X86,
+            "qemu_target": lambda: _qemu_target("X86QemuTarget"),
+            "qemu_env_var": "HALUCINATOR_QEMU_X86",
+            "qemu_default_path": os.path.join(
+                _QEMU_DEFAULT_LOC, "i386-softmmu/qemu-system-i386"
+            ),
+        },
         # RV32 (RISC-V, 32-bit, little-endian). In-process unicorn backend only:
         # avatar2 has no RISC-V arch and the fleet's qemu build ships no
         # riscv-softmmu, so avatar_arch is None and the qemu_target lambda is a
