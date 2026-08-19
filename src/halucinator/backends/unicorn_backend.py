@@ -3633,7 +3633,14 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         device-bmxnoe-arm / device-iologik-e1200 / device-m340, which are pure
         ARM-mode images.
         """
-        if self._x86_bigseg:
+        # getattr, not a bare attribute: `_resume_addr` is reachable on a
+        # backend built with UnicornBackend.__new__() and only `arch_name` /
+        # `_is_thumb` / `_uc` populated -- which is exactly the contract
+        # test/pytest/test_arm_thumb_resume.py has always relied on. A bare
+        # `self._x86_bigseg` here turned both of those tests into
+        # AttributeError. Live runs always go through __init__ and are
+        # unaffected, so the failure is invisible outside the test suite.
+        if getattr(self, "_x86_bigseg", False):
             # 16-bit PROTECTED mode (machine.segment_shift): unlike unicorn's
             # real mode -- which derives eip = begin - CS.base internally --
             # emu_start() here takes EIP DIRECTLY, while every hook still
