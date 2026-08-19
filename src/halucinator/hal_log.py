@@ -25,7 +25,16 @@ def setLogConfig():
     hal_log = getHalLogger()
     if path.isfile(LOG_CONFIG_NAME):
         hal_log.info("USING LOGGING CONFIG From: %s" % LOG_CONFIG_NAME)
-        logging.config.fileConfig(fname=LOG_CONFIG_NAME, disable_existing_loggers=True)
+        # disable_existing_loggers MUST match the default-config branch below.
+        # Every halucinator module does `log = logging.getLogger(__name__)` at
+        # IMPORT time, i.e. before setLogConfig() runs, so those loggers are
+        # all "existing" by the time this executes. With True, dropping a
+        # logging.cfg into the working directory silenced every `halucinator.*`
+        # logger in the process -- the run still worked, you just went blind,
+        # and a broken peripheral model (see _x86_in_hook, which logs a warning
+        # and then returns 0) became completely silent. The packaged-default
+        # branch has always used False; this asymmetry was the bug.
+        logging.config.fileConfig(fname=LOG_CONFIG_NAME, disable_existing_loggers=False)
     else:  # Default logging
         hal_log.info("USING DEFAULT LOGGING CONFIG")
         hal_log.info("This behavior can be overwritten by defining %s"% LOG_CONFIG_NAME)
