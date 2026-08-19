@@ -3239,7 +3239,10 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                     and getattr(self, "_det_insns", 0)
                     >= self._det_period * irq_chunk):
                 self._det_insns = 0
-                if self._det_irq not in self._pending_irqs:
+                # Same gate as the chunk-counting site below: a Cortex-M
+                # SysTick the firmware has not enabled yet must not fire.
+                if (self._det_irq not in self._pending_irqs
+                        and self._det_tick_armed()):
                     self._pending_irqs.append(self._det_irq)
             if self._pending_irqs:
                 continue
@@ -3262,8 +3265,9 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                         # A real GIC won't deliver a line the firmware hasn't
                         # enabled yet, and a tick during exception bring-up
                         # runs the ISR before the scheduler exists.
-                        if (self._gic_dist_base is None
-                                or self._det_irq in self._gic_enabled_irqs):
+                        if ((self._gic_dist_base is None
+                             or self._det_irq in self._gic_enabled_irqs)
+                                and self._det_tick_armed()):
                             self._pending_irqs.append(self._det_irq)
                 continue
             # A Cortex-M exception return (_maybe_handle_exc_return) redirected PC
@@ -3610,6 +3614,133 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         self.write_register("pc", isr_addr & ~1)  # Thumb bit goes in CPSR.T
         log.info("inject_irq(%d): exc %d @ 0x%x (exc_return %#x)",
                  irq_num, exc_num, isr_addr, exc_ret)
+
+    # ------------------------------------------------------------------
+    # Cortex-M SysTick gate for the deterministic tick.
+    #
+    # The GIC branch above already refuses to deliver a line the firmware has
+    # not enabled. Cortex-M had no equivalent, so `HAL_DET_TICK=-1:N` started
+    # delivering SysTick from the FIRST completed chunk — i.e. from the reset
+    # stub, long before the RTOS kernel exists. Real silicon cannot do that:
+    # SysTick is disabled out of reset and the firmware turns it on in its
+    # clock-driver init.
+    #
+    # Measured on `device-opendeck-samd51` (Zephyr 4.x on a SAMD51): with the
+    # tick ungated the boot died in `z_time_slice()` with
+    # `UC_ERR_READ_UNMAPPED at 0x8000000f` — the timer ISR announcing ticks
+    # into a `_kernel` that `z_cstart()` had not yet initialised. There is no
+    # diagnostic pointing at the tick; it reads as a firmware fault in the
+    # scheduler. Raising the period until the first tick happened to land after
+    # kernel init made it boot, which is a coincidence, not a fix.
+    #
+    # The gate is the hardware's own: SYST_CSR (0xE000E010) bit0 ENABLE and
+    # bit1 TICKINT. The PPB is plain RW memory here, so the firmware's own
+    # write to that register is readable. Non-Cortex-M arches and any other
+    # `_det_irq` value are unaffected.
+    _SYST_CSR = 0xE000E010
+    _SYST_CSR_ENABLE = 1 << 0
+    _SYST_CSR_TICKINT = 1 << 1
+    _SYST_CSR_COUNTFLAG = 1 << 16
+    _SYST_CVR = 0xE000E018
+
+    def _det_tick_systick_wrap(self) -> None:
+        """Present the register state a SysTick underflow leaves behind.
+
+        Delivering exception 15 is not by itself a system-clock tick. A
+        tickless Cortex-M driver reads the counter to find out HOW MUCH time
+        passed, and with the PPB as plain memory it reads the same values for
+        ever, so it announces **zero** ticks: the ISR runs at full rate, no
+        timeout ever expires, and every thread that sleeps stays asleep. There
+        is no error and no log line -- the system simply goes idle and stays
+        there.
+
+        Measured on `device-opendeck-samd51` (Zephyr on a SAMD51): its
+        `elapsed()` at 0x0002D688 reads `SYST_CVR`, `SYST_CSR` and `SYST_CVR`
+        again, and adds `last_load` to `overflow_cyc` only when
+        `CSR.COUNTFLAG` is set or the counter visibly wrapped. `sys_clock_isr`
+        then divides `overflow_cyc` by `CYC_PER_TICK`, so with COUNTFLAG clear
+        it announces 0 and `k_sleep()` never returns.
+
+        So: each delivered tick reloads the counter (`CVR = 0`) and raises
+        `CSR.COUNTFLAG`, exactly as the hardware does on underflow. COUNTFLAG
+        is **clear-on-read** in silicon, which matters here -- leaving it set
+        makes every later `elapsed()` add another full reload and the clock
+        runs away -- so `_install_systick_countflag_hook()` clears it after any
+        read, which is the same contract.
+        """
+        try:
+            self._uc.mem_write(self._SYST_CVR, (0).to_bytes(4, "little"))
+        except Exception:  # noqa: BLE001
+            pass
+        self._systick_cf_pending = True
+
+    def _install_systick_countflag_hook(self) -> None:
+        """SYST_CSR.COUNTFLAG is set by an underflow and CLEARED BY READING IT
+        (ARMv7-M B3.3.1), and getting the clear half wrong is not cosmetic.
+
+        Zephyr's `elapsed()` adds one whole reload to `overflow_cyc` every time
+        it sees the flag, so a flag that stays set makes *every* later
+        `sys_clock_elapsed()` add another tick's worth. Measured here: guest
+        time ran away, and OpenDeck's 4-second SysEx-session inactivity timer
+        expired between two consecutive host requests -- the session closed
+        after every single frame and the device answered `ErrorConnection`
+        (0x03) to everything, which reads exactly like a broken protocol seam.
+
+        Note `UC_HOOK_MEM_READ_AFTER` **cannot be range-bounded** on this
+        unicorn (`hook_add(..., begin=, end=)` returns UC_ERR_ARG), and an
+        unbounded read hook would fire on every load in the guest. So the flag
+        is presented from the *pre-read* hook instead, which does support a
+        range: the hook writes the bit the load is about to sample and then
+        leaves it clear, which is the same observable contract.
+        """
+        if getattr(self, "_systick_cf_hook", False):
+            return
+        self._systick_cf_hook = True
+        self._systick_cf_pending = getattr(self, "_systick_cf_pending", False)
+
+        def _cf_present(uc, access, addr, size, value, ud):  # noqa: ANN001
+            try:
+                csr = int.from_bytes(uc.mem_read(self._SYST_CSR, 4), "little")
+                if self._systick_cf_pending:
+                    self._systick_cf_pending = False
+                    uc.mem_write(self._SYST_CSR,
+                                 (csr | self._SYST_CSR_COUNTFLAG)
+                                 .to_bytes(4, "little"))
+                elif csr & self._SYST_CSR_COUNTFLAG:
+                    uc.mem_write(self._SYST_CSR,
+                                 (csr & ~self._SYST_CSR_COUNTFLAG)
+                                 .to_bytes(4, "little"))
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            self._uc.hook_add(unicorn.UC_HOOK_MEM_READ, _cf_present,
+                              begin=self._SYST_CSR, end=self._SYST_CSR + 3)
+        except Exception as exc:  # noqa: BLE001
+            hlog.warning("UnicornBackend: SysTick COUNTFLAG clear-on-read hook "
+                         "not installed (%s) -- guest time will run away",
+                         exc)
+
+    def _det_tick_armed(self) -> bool:
+        """True when the deterministic tick is allowed to fire.
+
+        Everything except a Cortex-M SysTick tick is unconditionally armed.
+        """
+        if self.arch_name != "cortex-m3" or self._det_irq != -1:
+            return True
+        try:
+            csr = int.from_bytes(self._uc.mem_read(self._SYST_CSR, 4), "little")
+        except Exception:  # noqa: BLE001
+            return True          # not readable -> do not change behaviour
+        want = self._SYST_CSR_ENABLE | self._SYST_CSR_TICKINT
+        if (csr & want) != want:
+            return False
+        if not getattr(self, "_det_tick_armed_logged", False):
+            self._det_tick_armed_logged = True
+            self._install_systick_countflag_hook()
+            hlog.info("UnicornBackend: SysTick armed by firmware "
+                      "(SYST_CSR=0x%08x) -- deterministic tick starts", csr)
+        self._det_tick_systick_wrap()
+        return True
 
     # SCB->ICSR. Bits we own here: VECTACTIVE[8:0] — the exception number the
     # CPU is currently executing — and RETTOBASE[11] — "returning from this
