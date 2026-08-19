@@ -415,7 +415,9 @@ def _get_x86_reg_map() -> Dict[str, int]:
              # these an intercept has to mask the 32-bit view by hand and a
              # write silently clobbers the (nonexistent) high half.
              "ax", "bx", "cx", "dx", "si", "di", "bp", "sp16", "ip", "flags",
-             "al", "ah", "bl", "bh", "cl", "ch", "dl", "dh")
+             "al", "ah", "bl", "bh", "cl", "ch", "dl", "dh",
+             # Needed only by machine.segment_shift (16-bit protected mode).
+             "gdtr", "cr0")
     m: Dict[str, int] = {}
     for name in names:
         v = getattr(x86_const, f"UC_X86_REG_{name.upper()}", None)
@@ -584,6 +586,26 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         # x86 in EITHER width has byte-aligned instructions.
         self._x86 = arch in ("x86", "x86-16")
         self._x86_16 = arch == "x86-16"
+        # `machine.segment_shift` -- the number of bits a real-mode segment
+        # value is shifted to form its base. It is 4 on every PC-compatible
+        # part (a 16-byte paragraph, a 20-bit/1 MiB space), and unicorn
+        # hardcodes that in C. It is NOT universal: the APC HW05/HW06 "Rhodes"
+        # SoC uses a 256-BYTE paragraph (shift 8), giving a 24-bit / 16 MiB
+        # space, and 3 MB firmware modules that simply cannot be expressed in
+        # 1 MiB. See _x86_bigseg_init() for how a non-4 shift is realised.
+        _shift = kwargs.pop("segment_shift", None)
+        self._x86_seg_shift = int(_shift) if _shift else 4
+        if not 4 <= self._x86_seg_shift <= 16:
+            raise ValueError(
+                f"machine.segment_shift must be 4..16, got "
+                f"{self._x86_seg_shift!r}")
+        self._x86_bigseg = self._x86_16 and self._x86_seg_shift != 4
+        # Linear addresses are (segment << shift) + a 16-bit offset.
+        self._x86_pc_mask = (1 << (16 + self._x86_seg_shift)) - 1
+        # TRUE (unshifted) segment values, authoritative in bigseg mode: the
+        # CPU's segment registers there hold GDT selectors, not segment values.
+        self._x86_seg_true: Dict[str, int] = {
+            n: 0 for n in ("es", "cs", "ss", "ds", "fs", "gs")}
         self._bp_addr_mask = 0xFFFFFFFF if self._x86 else 0xFFFFFFFE
         self._uc: Optional[Any] = None           # unicorn.Uc instance
         self._regions: List[MemoryRegion] = []
@@ -790,8 +812,17 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                 uc_mode = unicorn.UC_MODE_PPC32 | unicorn.UC_MODE_BIG_ENDIAN
         elif arch_str == "x86":
             uc_arch = unicorn.UC_ARCH_X86
-            uc_mode = (unicorn.UC_MODE_16 if mode_str == "x86_16"
-                       else unicorn.UC_MODE_32)
+            if mode_str == "x86_16":
+                # A non-default segment shift cannot be done in unicorn's real
+                # mode at all (QEMU computes `selector << 4` in C and exposes
+                # no override), so a bigseg guest runs in **16-bit protected
+                # mode** instead: UC_MODE_32 with D/B=0 descriptors decodes the
+                # identical 16-bit instruction stream, and a descriptor base is
+                # an arbitrary 32-bit number. See _x86_bigseg_init().
+                uc_mode = (unicorn.UC_MODE_32 if self._x86_bigseg
+                           else unicorn.UC_MODE_16)
+            else:
+                uc_mode = unicorn.UC_MODE_32
         elif arch_str == "riscv":
             uc_arch = unicorn.UC_ARCH_RISCV
             # RV64 would be UC_MODE_RISCV64; only RV32 is wired today. RISC-V is
@@ -828,6 +859,8 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         # applies it before the entry PC is written, so a `pc:` in the config
         # that lies inside that CS resolves without the re-segmentation
         # fallback in write_register(). Accepts cs/ds/es/fs/gs/ss/sp.
+        if self._x86_bigseg:
+            self._x86_bigseg_init()
         if self._x86_16:
             import os as _os
             _segs = _os.environ.get("HAL_X86_INIT_SEGS", "")
@@ -846,8 +879,11 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                     hlog.warning("HAL_X86_INIT_SEGS: bad value %r for %s",
                                  _v, _n)
                     continue
-                self._uc.reg_write(
-                    self._reg_map["esp" if _n == "sp" else _n], _val)
+                if _n != "sp" and self._x86_bigseg:
+                    self.x86_set_segment(_n, _val)
+                else:
+                    self._uc.reg_write(
+                        self._reg_map["esp" if _n == "sp" else _n], _val)
                 hlog.info("HAL_X86_INIT_SEGS: %s = 0x%04x", _n, _val)
 
         # Cortex-M kernels (Zephyr, FreeRTOS, MCUXpresso) use `msr/mrs` to
@@ -2007,10 +2043,9 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
             return True
         try:
             rm = self._reg_map
-            cs = uc.reg_read(rm["cs"]) & 0xFFFF
+            cs = self.x86_segment_true("cs")
             ip = uc.reg_read(rm["eip"]) & 0xFFFF
             fl = uc.reg_read(rm["eflags"]) & 0xFFFF
-            ss = uc.reg_read(rm["ss"]) & 0xFFFF
             sp = uc.reg_read(rm["esp"]) & 0xFFFF
             # Read the vector FIRST: an unprogrammed slot (all zeroes, or the
             # 0xFFFF:0xFFFF of erased flash) means the firmware never installed
@@ -2026,13 +2061,13 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                              "(%04x:%04x) -- not delivering",
                              intno, cs, ip, new_cs, new_ip)
                 return False
-            ss_base = ss << 4
+            ss_base = self.x86_segment_base("ss")
             for word in (fl, cs, ip):
                 sp = (sp - 2) & 0xFFFF
                 uc.mem_write(ss_base + sp, int(word).to_bytes(2, "little"))
             uc.reg_write(rm["esp"], sp)
             uc.reg_write(rm["eflags"], fl & ~0x0300)   # clear IF (9) and TF (8)
-            uc.reg_write(rm["cs"], new_cs)
+            self.x86_set_segment("cs", new_cs)
             uc.reg_write(rm["eip"], new_ip)
             log.debug("x86-16: int 0x%02x  %04x:%04x -> %04x:%04x (sp=0x%04x)",
                       intno, cs, ip, new_cs, new_ip, sp)
@@ -2907,7 +2942,86 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
     # segment registers themselves) is passed through untouched -- sp is an
     # offset into SS by definition and must stay one.
     def _x86_cs_base(self) -> int:
+        if self._x86_bigseg:
+            return self._x86_seg_true["cs"] << self._x86_seg_shift
         return (self._uc.reg_read(self._reg_map["cs"]) & 0xFFFF) << 4
+
+    # -- x86-16 with a non-default segment shift (`machine.segment_shift`) --
+    #
+    # unicorn's real mode is hardwired to a 16-byte paragraph. To give a guest
+    # a 256-byte paragraph (and with it a 24-bit address space) the CPU is put
+    # in **16-bit protected mode**: UC_MODE_32 with every descriptor's D/B bit
+    # CLEAR, which decodes exactly the same 16-bit instruction stream and keeps
+    # SP 16-bit, while a descriptor base is a free 32-bit number.
+    #
+    # The guest never knows: it goes on writing `mov ds,0xEC7A`, and a device
+    # shim (UC_HOOK_CODE) turns each such load into x86_set_segment("ds",
+    # 0xEC7A). The load the guest itself performs is a nonsense SELECTOR, so
+    # the GDT is a full 8192 descriptors, all present, so that no segment load
+    # the firmware can invent raises #GP before the shim corrects it on the
+    # next instruction.
+    _X86_GDT_ADDR = 0x7F000000            # outside any 24-bit guest map
+    _X86_GDT_LIMIT = 0xFFFF               # 8192 descriptors == every selector
+    # Fixed selectors the shim actually installs (index 1..6).
+    _X86_SEL = {"es": 0x08, "cs": 0x10, "ss": 0x18,
+                "ds": 0x20, "fs": 0x28, "gs": 0x30}
+
+    @staticmethod
+    def _x86_descriptor(base: int, limit: int, code: bool) -> bytes:
+        """One 8-byte GDT descriptor, 16-bit (D/B=0), byte-granular (G=0)."""
+        access = 0x9A if code else 0x92   # P=1 DPL=0 S=1, exec/read or r/w
+        return bytes((
+            limit & 0xFF, (limit >> 8) & 0xFF,
+            base & 0xFF, (base >> 8) & 0xFF, (base >> 16) & 0xFF,
+            access,
+            ((limit >> 16) & 0x0F),       # G=0, D/B=0, AVL=0
+            (base >> 24) & 0xFF,
+        ))
+
+    def _x86_bigseg_init(self) -> None:
+        """Build the GDT, enter 16-bit protected mode, load the six selectors."""
+        uc = self._uc
+        gdt = self._X86_GDT_ADDR
+        uc.mem_map(gdt, 0x10000, unicorn.UC_PROT_ALL)
+        # Descriptor 0 is architecturally the null descriptor; every other
+        # entry is a present 64 KiB data segment at base 0, so that a garbage
+        # selector loaded by the guest lands somewhere legal instead of
+        # faulting. (QEMU also writes the Accessed bit back, hence PROT_ALL.)
+        filler = self._x86_descriptor(0, 0xFFFF, False)
+        uc.mem_write(gdt, b"\x00" * 8 + filler * ((0x10000 // 8) - 1))
+        uc.reg_write(self._reg_map["gdtr"], (0, gdt, self._X86_GDT_LIMIT, 0))
+        uc.reg_write(self._reg_map["cr0"],
+                     uc.reg_read(self._reg_map["cr0"]) | 1)   # PE
+        for name in ("es", "cs", "ss", "ds", "fs", "gs"):
+            self.x86_set_segment(name, 0)
+        hlog.info("UnicornBackend[x86-16]: segment_shift=%d -- 16-bit "
+                  "protected mode, %d-bit address space, GDT at 0x%08x",
+                  self._x86_seg_shift, 16 + self._x86_seg_shift, gdt)
+
+    def x86_set_segment(self, name: str, true_value: int) -> None:
+        """Set segment register `name` to the guest's TRUE segment value."""
+        name = name.lower()
+        true_value &= 0xFFFF
+        self._x86_seg_true[name] = true_value
+        if not self._x86_bigseg:
+            self._uc.reg_write(self._reg_map[name], true_value)
+            return
+        sel = self._X86_SEL[name]
+        self._uc.mem_write(
+            self._X86_GDT_ADDR + sel,
+            self._x86_descriptor(true_value << self._x86_seg_shift, 0xFFFF,
+                                 name == "cs"))
+        self._uc.reg_write(self._reg_map[name], sel)
+
+    def x86_segment_true(self, name: str) -> int:
+        """The guest's TRUE segment value for `name`."""
+        name = name.lower()
+        if self._x86_bigseg:
+            return self._x86_seg_true[name]
+        return self._uc.reg_read(self._reg_map[name]) & 0xFFFF
+
+    def x86_segment_base(self, name: str) -> int:
+        return self.x86_segment_true(name) << self._x86_seg_shift
 
     def read_register(self, register: str) -> int:
         r = register.lower()
@@ -2916,7 +3030,8 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
             raise ValueError(f"Unknown register: {register!r}")
         v = self._uc.reg_read(uc_reg)
         if self._x86_16 and r == "pc":
-            return (self._x86_cs_base() + (v & 0xFFFF)) & 0xFFFFF
+            return ((self._x86_cs_base() + (v & 0xFFFF))
+                    & self._x86_pc_mask)
         return v
 
     def write_register(self, register: str, value: int) -> None:
@@ -2926,7 +3041,7 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
             raise ValueError(f"Unknown register: {register!r}")
         if self._x86_16 and r == "pc":
             base = self._x86_cs_base()
-            off = (value & 0xFFFFF) - base
+            off = (value & self._x86_pc_mask) - base
             if not (0 <= off <= 0xFFFF):
                 # The requested linear address is not reachable from the
                 # current code segment. Re-seg onto the nearest paragraph so
@@ -2935,13 +3050,16 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                 # cares about (an ISR's CS is pushed and restored by iret), and
                 # a synthesised CS is a guess. Silently truncating instead
                 # would put the CPU somewhere unrelated.
-                new_cs = (value >> 4) & 0xFFFF
-                hlog.warning("UnicornBackend[x86-16]: pc=0x%05x is outside "
-                             "CS=0x%04x (base 0x%05x); re-segmenting to "
-                             "CS=0x%04x:0x%04x", value & 0xFFFFF,
-                             base >> 4, base, new_cs, value & 0xF)
-                self._uc.reg_write(self._reg_map["cs"], new_cs)
-                off = value & 0xF
+                shift = self._x86_seg_shift
+                new_cs = (value >> shift) & 0xFFFF
+                hlog.warning("UnicornBackend[x86-16]: pc=0x%06x is outside "
+                             "CS=0x%04x (base 0x%06x); re-segmenting to "
+                             "CS=0x%04x:0x%04x",
+                             value & self._x86_pc_mask,
+                             base >> shift, base, new_cs,
+                             value & ((1 << shift) - 1))
+                self.x86_set_segment("cs", new_cs)
+                off = value & ((1 << shift) - 1)
             self._uc.reg_write(uc_reg, off & 0xFFFF)
             return
         self._uc.reg_write(uc_reg, value)
@@ -3515,6 +3633,22 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
         device-bmxnoe-arm / device-iologik-e1200 / device-m340, which are pure
         ARM-mode images.
         """
+        if self._x86_bigseg:
+            # 16-bit PROTECTED mode (machine.segment_shift): unlike unicorn's
+            # real mode -- which derives eip = begin - CS.base internally --
+            # emu_start() here takes EIP DIRECTLY, while every hook still
+            # reports the linear CS.base + EIP. Measured on unicorn 2.1.4.
+            # halucinator's `pc` is linear, so de-linearise on the way in.
+            # (Getting this wrong is silent: the CPU simply runs somewhere
+            # else, exactly as the shift-4 path documents above.)
+            off = pc - self._x86_cs_base()
+            if not 0 <= off <= 0xFFFF:
+                hlog.warning("UnicornBackend[x86-16]: resume pc=0x%06x is "
+                             "outside CS=0x%04x; re-segmenting",
+                             pc, self.x86_segment_true("cs"))
+                self.write_register("pc", pc)
+                off = self._uc.reg_read(self._reg_map["eip"]) & 0xFFFF
+            return off
         if self._is_thumb:
             return pc | 1
         if self._is_arm_profile_a():

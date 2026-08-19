@@ -163,8 +163,14 @@ class HALMachineConfig:
         machine: Optional[str] = None,
         interrupt_controller: Optional[Dict[str, Any]] = None,
         irq_delivery: Optional[Dict[str, Any]] = None,
+        segment_shift: Optional[int] = None,
     ) -> None:  # pylint: disable=too-many-arguments
         self.arch = arch
+        # x86-16 only: how many bits a real-mode segment value is shifted to
+        # form its base. 4 (a 16-byte paragraph, 1 MiB) everywhere PC-derived;
+        # 8 on the APC HW05/HW06 "Rhodes" SoC, which is a 256-byte paragraph
+        # and a 24-bit / 16 MiB space. None == the architecture default.
+        self.segment_shift = segment_shift
         self.machine = machine
         self.cpu_model = cpu_model
         self.entry_addr = entry_addr

@@ -1127,7 +1127,9 @@ def _emulate_with_unicorn_backend(
     os.makedirs(os.path.join(outdir, "logs"), exist_ok=True)
     hal_stats.set_filename(outdir + "/stats.yaml")
 
-    backend: "HalBackend" = UnicornBackend(arch=arch)
+    backend: "HalBackend" = UnicornBackend(
+        arch=arch,
+        segment_shift=getattr(config.machine, "segment_shift", None))
 
     # Register memory regions from config, loading any firmware file bytes
     # into the region on add. Regions with an `emulate:` peripheral get
