@@ -94,15 +94,30 @@ def _require_falcon(fw):
         pytest.skip("GHIDRA_INSTALL_DIR not set")
     if not fw.exists():
         pytest.skip(f"{fw} missing")
+    from halucinator.backends.ghidra_backend import GhidraBackend
+    from halucinator.backends.hal_backend import MemoryRegion
+
+    # Distinguish "not installed" from "installed and broken". Skipping the
+    # second is how a half-installed module reports fifteen passes' worth of
+    # green while executing nothing: removing the extension's jar made every
+    # test skip, because the language is present but its declared instruction
+    # state modifier cannot be constructed. That is a misconfiguration to
+    # report, not an absence to tolerate.
     try:
-        from halucinator.backends.ghidra_backend import GhidraBackend
-        from halucinator.backends.hal_backend import MemoryRegion
-        probe = GhidraBackend(arch="falcon", cpu_model="fuc5")
-        probe.add_memory_region(MemoryRegion("imem", 0x0, 0x100,
-                                             permissions="rwx"))
-        probe.init()
+        import pyghidra  # noqa: F401
+        pyghidra.start(verbose=False)
+        from ghidra.program.util import DefaultLanguageService  # type: ignore
+        from ghidra.program.model.lang import LanguageID  # type: ignore
+        DefaultLanguageService.getLanguageService().getLanguage(
+            LanguageID("Falcon:LE:32:fuc5"))
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"Falcon language unavailable: {exc}")
+        pytest.skip(f"Falcon processor module not installed: {exc}")
+
+    # The language exists. Anything that fails from here is a real problem.
+    probe = GhidraBackend(arch="falcon", cpu_model="fuc5")
+    probe.add_memory_region(MemoryRegion("imem", 0x0, 0x100,
+                                         permissions="rwx"))
+    probe.init()
 
 
 @pytest.fixture(scope="module")
