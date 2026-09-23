@@ -66,6 +66,7 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
         config: Any = None,
         arch: str = "cortex-m3",
         ghidra_install_dir: Optional[str] = None,
+        cpu_model: Optional[str] = None,
         **kwargs: Any,
     ):
         if not _HAVE_PYGHIDRA:
@@ -75,10 +76,19 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
             )
         self.config = config
         self.arch = arch
+        # A processor variant, where the arch has them (Falcon's fuc4/fuc5).
+        # Resolved against _LANGUAGE_MAP as "<arch>-<cpu_model>" in init().
+        # It used to be swallowed by **kwargs, so cpu_model="fuc4" silently
+        # loaded fuc5 and the first instruction that differs simply failed to
+        # decode.
+        self.cpu_model = cpu_model
         self.ghidra_install_dir = (
             ghidra_install_dir
             or os.environ.get("GHIDRA_INSTALL_DIR")
         )
+        # Set by a halting pcodeop (Falcon `exit`); step()/cont() honour it.
+        self._halted = False
+        self._halt_pc: Optional[int] = None
         self._regions: List[MemoryRegion] = []
         self._breakpoints: Dict[int, int] = {}  # addr -> bp_id
         # Watchpoints: bp_id -> (addr, size, read, write)
@@ -129,6 +139,23 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
         from ghidra.app.emulator import EmulatorHelper
 
         lang_id_str = _LANGUAGE_MAP.get(self.arch)
+        if self.cpu_model:
+            variant = f"{self.arch}-{self.cpu_model}"
+            if variant in _LANGUAGE_MAP:
+                lang_id_str = _LANGUAGE_MAP[variant]
+                log.info("GhidraBackend: cpu_model=%r selects %s",
+                         self.cpu_model, lang_id_str)
+            elif lang_id_str and not lang_id_str.endswith(f":{self.cpu_model}"):
+                # Naming a variant that does not exist is a configuration
+                # error; saying nothing would run the default and look fine.
+                log.warning(
+                    "GhidraBackend: cpu_model=%r is not a known variant of "
+                    "arch=%r (have %s); using %s",
+                    self.cpu_model, self.arch,
+                    ", ".join(sorted(k.split("-", 1)[1]
+                                     for k in _LANGUAGE_MAP
+                                     if k.startswith(self.arch + "-"))) or "none",
+                    lang_id_str)
         if lang_id_str is None:
             raise ValueError(
                 f"GhidraBackend: no language mapping for arch={self.arch!r}"
@@ -212,6 +239,8 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
             self._patch_arm_unimplemented_callothers()
         elif self.arch == "arm64":
             self._patch_arm_unimplemented_callothers()
+        elif self.arch in self._HALT_CALLOTHERS:
+            self._install_halt_callother(self._HALT_CALLOTHERS[self.arch])
         elif self.arch in self._CALLOTHER_STUBS:
             self._patch_unimplemented_callothers(self._CALLOTHER_STUBS[self.arch])
 
@@ -452,6 +481,8 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
             while self._pending_irqs:
                 self._apply_pending_irq(self._pending_irqs.pop(0))
             for _ in range(self._STEP_BATCH):
+                if self._halted:
+                    return
                 if not self._emulator.step(TaskMonitor.DUMMY):
                     # If the firmware just ran `bx lr` with LR holding
                     # an EXC_RETURN magic, Ghidra raises a decode
@@ -531,6 +562,8 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
         if self._emulator is None:
             raise RuntimeError("Call GhidraBackend.init() first")
         from ghidra.util.task import TaskMonitor  # type: ignore
+        if self._halted:
+            return
         # A failed step leaves PC where it was. Callers that step in a loop
         # would otherwise spin on the same faulting instruction for the whole
         # budget and report a plausible-looking "did not finish" -- which is
@@ -1060,21 +1093,60 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
 
     # CALLOTHER pcodeops to stub per architecture, beyond the ARM set below.
     # A stub returns 0 into the output varnode (if any) instead of faulting.
+    # Pcodeops that stop the core rather than completing. `exit` on Falcon
+    # halts; the processor module's own default completes, because Ghidra's
+    # Emulate cannot stop from inside a behaviour, so the backend supplies it.
+    _HALT_CALLOTHERS: Dict[str, set] = {
+        "falcon":      {"FalconHalt"},
+        "falcon-fuc4": {"FalconHalt"},
+    }
+
     _CALLOTHER_STUBS: Dict[str, set] = {
-        # Falcon: `sleep` waits for a predicate we have no way to set without
-        # an interrupt source, and the crypt coprocessor is not modelled.
-        # Stubbing them lets boot continue instead of FAULTing.
-        "falcon":      {"FalconSleep", "FalconHalt", "FalconCrypt",
-                        "FalconCryptImm", "FalconSext", "FalconBitTest",
-                        "FalconXfer", "FalconItlb", "FalconPtlb", "FalconVtlb"},
-        "falcon-fuc4": {"FalconSleep", "FalconHalt", "FalconCrypt",
-                        "FalconCryptImm", "FalconSext", "FalconBitTest",
-                        "FalconXfer", "FalconItlb", "FalconPtlb", "FalconVtlb"},
+        # Falcon needs no stub table. Its processor module declares an
+        # instruction state modifier which carries defaults for the ops that
+        # are device behaviour rather than CPU semantics (DMA, crypt, TLB), and
+        # everything else is modelled in SLEIGH. The table that used to be here
+        # never ran at all: without a state modifier Ghidra has no pcodeOpMap,
+        # so _install_callother_stubs returned at its `state_mod is None` guard
+        # and the names were never installed. Two of them -- FalconSext and
+        # FalconXfer -- had also stopped existing.
         # MIPS: setISAMode toggles MIPS16/microMIPS; firmware that never uses
         # those modes only needs it not to fault.
         "mips":        {"setISAMode"},
         "mipsel":      {"setISAMode"},
     }
+
+    def _install_halt_callother(self, names) -> None:
+        """Make the named pcodeops halt the backend instead of completing.
+
+        `exit` on Falcon stops the core. Ghidra's Emulate exposes no way to
+        stop from inside an OpBehaviorOther, so the behaviour installed here
+        records it on the backend and step()/cont() act on the flag.
+        """
+        import jpype  # type: ignore
+        from ghidra.pcode.emulate.callother import OpBehaviorOther  # type: ignore
+
+        backend = self
+
+        @jpype.JImplements(OpBehaviorOther)
+        class _Halting:
+            @jpype.JOverride
+            def evaluate(self, emu, out, inputs):
+                # Record where it stopped. Falcon's `exit` is a flow
+                # terminator, so by the time a caller reads pc it is 0 and the
+                # useful address is gone; take it from the emulator now.
+                try:
+                    addr = emu.getExecuteAddress()
+                    backend._halt_pc = int(addr.getUnsignedOffset())
+                except Exception:  # noqa: BLE001
+                    backend._halt_pc = None
+                backend._halted = True
+                log.info("GhidraBackend: core halted at pc=%s",
+                         hex(backend._halt_pc) if backend._halt_pc is not None
+                         else "unknown")
+
+        self._install_callother_stubs(names, (), label=f"{self.arch}-halt",
+                                      behavior=_Halting())
 
     def _patch_unimplemented_callothers(self, names: set) -> None:
         """Install zero-returning stubs for the named CALLOTHER pcodeops."""
@@ -1154,7 +1226,7 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
             explicit_targets, prefix_targets, label="ARM")
 
     def _install_callother_stubs(self, explicit_targets, prefix_targets=(),
-                                 label: str = "") -> None:
+                                 label: str = "", behavior=None) -> None:
         """Reflectively install zero-returning handlers for CALLOTHER pcodeops.
 
         Ghidra resolves a userop by index through the instruction state
@@ -1191,7 +1263,7 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
             f_map = parent.getDeclaredField("pcodeOpMap")
             f_map.setAccessible(True)
             op_map = f_map.get(state_mod)
-            handler = _ZeroReturning()
+            handler = behavior if behavior is not None else _ZeroReturning()
             installed = []
             for i in range(self._language.getNumberOfUserDefinedOpNames()):
                 name = str(self._language.getUserDefinedOpName(i))

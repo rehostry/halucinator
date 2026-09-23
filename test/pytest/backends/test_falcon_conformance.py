@@ -36,33 +36,32 @@ pytest.importorskip("pyghidra")
 FW = (pathlib.Path(__file__).resolve().parents[2]
       / "falcon_conformance" / "irq_compute.bin")
 
-M32 = 0xFFFFFFFF
-N_IRQ, TERMS = 8, 64
-IRQ_COUNT, MIX, SUM_SQ, DONE = 0x00, 0x04, 0x08, 0x0C
+import importlib.util as _ilu
+
+_spec = _ilu.spec_from_file_location(
+    "falcon_oracle",
+    pathlib.Path(__file__).resolve().parents[2] / "falcon_conformance" / "oracle.py")
+oracle = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(oracle)
+
+N_IRQ, TERMS = oracle.N_IRQ, oracle.TERMS
+DONE = oracle.DONE
 
 
-def _expected():
-    sum_sq = 0
-    for i in range(1, TERMS + 1):
-        sum_sq = (sum_sq + (i & 0xFFFF) * (i & 0xFFFF)) & M32
-    mix = 0
-    for k in range(1, N_IRQ + 1):
-        mix = (((mix & 0xFFFF) * 0x1F) + k) & M32
-    return N_IRQ, mix, sum_sq, mix ^ sum_sq
-
-
-def _run(no_timer=False, cap=400_000):
+def _run(no_timer=False, cap=400_000, fw=None, cpu_model="fuc5",
+         done_offset=None):
     from halucinator.backends.ghidra_backend import GhidraBackend
     from halucinator.backends.hal_backend import MemoryRegion
     from halucinator.backends.irq.delivery import DeliveryPlan
     from halucinator.peripheral_models.falcon_engine import FalconEngine
 
-    be = GhidraBackend(arch="falcon", cpu_model="fuc5")
+    be = GhidraBackend(arch="falcon", cpu_model=cpu_model)
     engine = FalconEngine("engine", 0x0, 0x40000)
     if no_timer:
         engine.tick = lambda steps=1: None
     be.add_memory_region(MemoryRegion("imem", 0x0, 0x8000,
-                                      permissions="rwx", file=str(FW)))
+                                      permissions="rwx",
+                                      file=str(fw or FW)))
     be.add_memory_region(MemoryRegion("dmem", 0x0, 0x4000,
                                       permissions="rw", space="dmem"))
     be.add_memory_region(MemoryRegion("io", 0x0, 0x40000, permissions="rw",
@@ -76,8 +75,9 @@ def _run(no_timer=False, cap=400_000):
         be.step()
         if be.read_memory(DONE, 4, space="dmem"):
             break
-    return be, engine, tuple(be.read_memory(a, 4, space="dmem")
-                             for a in (IRQ_COUNT, MIX, SUM_SQ, DONE))
+    got = {k: be.read_memory(off, 4, space="dmem")
+           for k, off in oracle.OFFSETS.items()}
+    return be, engine, got
 
 
 @pytest.fixture(scope="module")
@@ -93,24 +93,46 @@ def run():
 
 
 def test_the_firmware_finishes(run):
-    _, _, (_, _, _, done) = run
-    assert done, "firmware never wrote its done marker"
+    _, _, got = run
+    assert got["done"], "firmware never wrote its done marker"
 
 
 def test_every_word_is_exact(run):
     _, _, got = run
-    assert got == _expected()
+    assert got == oracle.expected()
 
 
 def test_the_arithmetic_is_right(run):
     """64 mulu+add terms, each through a call/ret over the DMEM stack."""
-    _, _, (_, _, sum_sq, _) = run
-    assert sum_sq == sum(i * i for i in range(1, TERMS + 1)) == 89440
+    _, _, got = run
+    assert got["sum_sq"] == sum(i * i for i in range(1, TERMS + 1)) == 89440
+
+
+def test_the_alu_chain_is_right(run):
+    """and/or/xor/shl/sar/hswap/xbit/sext/not/neg in one dependent chain.
+
+    Every one of these was either a `define pcodeop` -- opaque to an emulator,
+    and in mulu's case not even stubbed, so it faulted -- or missing entirely.
+    """
+    _, _, got = run
+    assert got["alu"] == oracle._alu()
+
+
+def test_mpush_preserves_the_registers_below_it(run):
+    """`mpush $r4` must save r0-r3 across a callee that destroys all four.
+
+    This pins a semantic that is derived rather than documented: the operand
+    is a count, not a single register. Under the single-register reading the
+    callee's writes reach the caller and this word is 0xDEADBEEF-ish garbage
+    instead of 0x11223344.
+    """
+    _, _, got = run
+    assert got["regs"] == 0x11223344
 
 
 def test_exactly_one_handler_entry_per_expiry(run):
-    _, engine, (irq_count, _, _, _) = run
-    assert irq_count == N_IRQ
+    _, engine, got = run
+    assert got["irq_count"] == N_IRQ
     assert engine.timer_ticks == N_IRQ
 
 
@@ -128,4 +150,40 @@ def test_without_a_timer_nothing_is_produced():
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"Falcon language unavailable: {exc}")
     assert engine.timer_ticks == 0
-    assert got == (0, 0, 0, 0)
+    assert all(v == 0 for v in got.values())
+
+
+# -- the fuc4 variant -------------------------------------------------------
+#
+# fuc4 and fuc5 include the same .sinc files, so a change made for one reaches
+# the other. Before this, fuc4 was only ever compiled, never executed.
+
+FW4 = (pathlib.Path(__file__).resolve().parents[2]
+       / "falcon_conformance" / "irq_compute_fuc4.bin")
+
+
+@pytest.fixture(scope="module")
+def run4():
+    if not os.environ.get("GHIDRA_INSTALL_DIR") or not FW4.exists():
+        pytest.skip("Falcon language unavailable")
+    try:
+        return _run(fw=FW4, cpu_model="fuc4", done_offset=oracle.DONE)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"Falcon fuc4 unavailable: {exc}")
+
+
+def test_fuc4_runs_and_is_exact(run4):
+    be, engine, got = run4
+    got4 = {k: got[k] for k in oracle.FUC4_OFFSETS}
+    assert got4 == oracle.expected_fuc4()
+
+
+def test_fuc4_took_its_interrupts(run4):
+    _, engine, got = run4
+    assert got["irq_count"] == oracle.FUC4_N_IRQ
+    assert engine.timer_ticks == oracle.FUC4_N_IRQ
+
+
+def test_fuc4_did_not_wedge(run4):
+    be, _, _ = run4
+    assert getattr(be, "_step_fault_pc", None) is None

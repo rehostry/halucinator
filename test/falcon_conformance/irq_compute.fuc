@@ -12,7 +12,9 @@
 //   0x00 irq_count   must be exactly 8
 //   0x04 mix         mix = ((mix & 0xffff) * 31 + k) for k = 1..8, in order
 //   0x08 sum_sq      sum of i*i for i = 1..64, computed through call/ret
-//   0x0c done        mix ^ sum_sq, written last
+//   0x0c done        mix ^ sum_sq ^ alu ^ regs, written last
+//   0x10 alu         a chain over and/or/xor/shl/sar/hswap/xbit/sext/not/neg
+//   0x14 regs        proof that `mpush $r4` really preserved r0-r3
 
 // -- init ------------------------------------------------------------------
         mov $r0 0x1000
@@ -26,6 +28,10 @@
         mov $r1 0x8
         st b32 D[$r1] $r0
         mov $r1 0xc
+        st b32 D[$r1] $r0
+        mov $r1 0x10
+        st b32 D[$r1] $r0
+        mov $r1 0x14
         st b32 D[$r1] $r0
 
 // -- install the handler ---------------------------------------------------
@@ -77,13 +83,75 @@ sumloop:
         mov $r1 0x8
         st b32 D[$r1] $r7
 
-// -- fold the interrupt-derived value into the final answer ---------------
+// -- ALU chain -------------------------------------------------------------
+// Every operation here was a `define pcodeop` -- a black box an emulator
+// cannot execute -- or was missing outright, until this firmware needed it.
+        mov $r1 0x1234
+        sethi $r1 0xabcd0000
+        mov $r2 0x0f0f
+        sethi $r2 0x0f0f0000
+        and $r3 $r1 $r2
+        or $r4 $r1 $r2
+        xor $r5 $r1 $r2
+        add b32 $r6 $r3 $r4
+        xor $r6 $r6 $r5
+        shl b32 $r6 $r6 0x3
+        sar b32 $r6 $r6 0x2
+        hswap b32 $r0 $r6
+        add b32 $r6 $r6 $r0
+        xbit $r0 $r1 0x10
+        add b32 $r6 $r6 $r0
+        sext $r0 $r2 0x7
+        add b32 $r6 $r6 $r0
+        not b32 $r0 $r2
+        add b32 $r6 $r6 $r0
+        neg b32 $r0 $r3
+        add b32 $r6 $r6 $r0
+        mov $r1 0x10
+        st b32 D[$r1] $r6
+
+// -- does `mpush $r4` actually preserve r0-r3? -----------------------------
+// This is the test for a semantic that is *derived*, not documented: the
+// operand is read as a count, so `mpush $r4` saves r0-r3. Model it as a
+// single-register push instead and `clobber` destroys the caller's values,
+// this word comes out different, and the run fails here rather than silently
+// computing something wrong somewhere else later.
+        mov $r0 0x11
+        mov $r1 0x22
+        mov $r2 0x33
+        mov $r3 0x44
+        call #clobber
+        shl b32 $r0 $r0 0x8
+        add b32 $r0 $r0 $r1
+        shl b32 $r0 $r0 0x8
+        add b32 $r0 $r0 $r2
+        shl b32 $r0 $r0 0x8
+        add b32 $r0 $r0 $r3
+        mov $r1 0x14
+        st b32 D[$r1] $r0
+
+// -- fold everything into the final answer --------------------------------
         mov $r1 0x4
         ld b32 $r3 D[$r1]
         xor $r3 $r3 $r7
+        mov $r1 0x10
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
+        mov $r1 0x14
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
         mov $r1 0xc
         st b32 D[$r1] $r3
         exit
+
+// -- saves r0-r3 via mpush, destroys them, restores them on the way out ----
+clobber:
+        mpush $r4
+        mov $r0 0xde
+        mov $r1 0xad
+        mov $r2 0xbe
+        mov $r3 0xef
+        mpopret $r4
 
 // -- $r2 = $r1 * $r1. Uses the DMEM stack for both push/pop and ret, which
 //    is the mix that catches a call pushing into the wrong address space.

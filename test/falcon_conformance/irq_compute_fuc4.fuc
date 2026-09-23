@@ -1,0 +1,110 @@
+// fuc4 counterpart of irq_compute.fuc.
+//
+// The fuc4 and fuc5 variants share every .sinc file, so a change made for one
+// silently reaches the other. fuc4 had never been executed at all; this is the
+// firmware that puts it under the same kind of test.
+//
+// Deliberately avoids the fuc5-only forms the fuc5 firmware leans on --
+// mpush/mpop and the register-register compares -- and uses the immediate
+// compare instead, so what runs here is the shared core.
+//
+// DMEM results:
+//   0x00 irq_count  exactly 6
+//   0x04 mix        ((mix & 0xffff) * 31 + k) for k = 1..6, in order
+//   0x08 sum_sq     sum of i*i for i = 1..32, through call/ret
+//   0x0c done       mix ^ sum_sq, written last
+
+        mov $r0 0x1000
+        mov $sp $r0
+
+        clear b32 $r0
+        mov $r1 0x0
+        st b32 D[$r1] $r0
+        mov $r1 0x4
+        st b32 D[$r1] $r0
+        mov $r1 0x8
+        st b32 D[$r1] $r0
+        mov $r1 0xc
+        st b32 D[$r1] $r0
+
+        mov $r1 #handler
+        mov $iv0 $r1
+
+        mov $r2 0x1
+        mov $r3 0x400
+        iowr I[$r3] $r2
+
+        mov $r2 0x64
+        mov $r3 0x800
+        iowr I[$r3] $r2
+        mov $r3 0x900
+        iowr I[$r3] $r2
+        mov $r2 0x1
+        mov $r3 0xa00
+        iowr I[$r3] $r2
+
+        bset $flags ie0
+
+wait:
+        mov $r1 0x0
+        ld b32 $r5 D[$r1]
+        cmpu b32 $r5 0x6
+        bra b #wait
+
+        bclr $flags ie0
+        clear b32 $r2
+        mov $r3 0xa00
+        iowr I[$r3] $r2
+
+        clear b32 $r7
+        mov $r8 0x1
+sumloop:
+        mov b32 $r1 $r8
+        call #square
+        add b32 $r7 $r7 $r2
+        add b32 $r8 $r8 0x1
+        cmpu b32 $r8 0x21
+        bra b #sumloop
+
+        mov $r1 0x8
+        st b32 D[$r1] $r7
+
+        mov $r1 0x4
+        ld b32 $r3 D[$r1]
+        xor $r3 $r3 $r7
+        mov $r1 0xc
+        st b32 D[$r1] $r3
+        exit
+
+square:
+        push $r1
+        mulu $r2 $r1 $r1
+        pop $r1
+        ret
+
+handler:
+        push $r1
+        push $r2
+        push $r3
+        push $r4
+        mov $r4 $flags
+        mov $r1 0x0
+        ld b32 $r2 D[$r1]
+        add b32 $r2 $r2 0x1
+        st b32 D[$r1] $r2
+        mov $r1 0x4
+        ld b32 $r3 D[$r1]
+        mov $r1 0x1f
+        mulu $r3 $r3 $r1
+        add b32 $r3 $r3 $r2
+        mov $r1 0x4
+        st b32 D[$r1] $r3
+        mov $r1 0x1
+        mov $r2 0x100
+        iowr I[$r2] $r1
+        mov $flags $r4
+        pop $r4
+        pop $r3
+        pop $r2
+        pop $r1
+        iret
