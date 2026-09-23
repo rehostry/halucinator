@@ -12,9 +12,11 @@
 //   0x00 irq_count   must be exactly 8
 //   0x04 mix         mix = ((mix & 0xffff) * 31 + k) for k = 1..8, in order
 //   0x08 sum_sq      sum of i*i for i = 1..64, computed through call/ret
-//   0x0c done        mix ^ sum_sq ^ alu ^ regs, written last
+//   0x0c done        mix ^ sum_sq ^ alu ^ regs ^ dma ^ tlb, written last
 //   0x10 alu         a chain over and/or/xor/shl/sar/hswap/xbit/sext/not/neg
 //   0x14 regs        proof that `mpush $r4` really preserved r0-r3
+//   0x18 dma         a DMEM -> external -> DMEM round trip through xdst/xdld
+//   0x1c tlb         ptlb/vtlb/itlb after a code load, folded together
 
 // -- init ------------------------------------------------------------------
         mov $r0 0x1000
@@ -32,6 +34,10 @@
         mov $r1 0x10
         st b32 D[$r1] $r0
         mov $r1 0x14
+        st b32 D[$r1] $r0
+        mov $r1 0x18
+        st b32 D[$r1] $r0
+        mov $r1 0x1c
         st b32 D[$r1] $r0
 
 // -- install the handler ---------------------------------------------------
@@ -130,14 +136,77 @@ sumloop:
         mov $r1 0x14
         st b32 D[$r1] $r0
 
+// -- DMA round trip --------------------------------------------------------
+// Writes a word to DMEM, stores it out to external memory with xdst, reads it
+// back to a different DMEM address with xdld, and keeps what came back. The
+// engine's external memory lives outside the emulator -- Falcon's SLEIGH has
+// no fourth address space to put it in -- so a broken path here returns zero
+// rather than the pattern.
+        clear b32 $r1
+        mov $xdbase $r1
+        clear b32 $r1
+        mov $xtargets $r1
+        mov $r2 0x200
+        mov $r3 0x5eed0042
+        st b32 D[$r2] $r3
+        clear b32 $r5
+        mov $r9 0x200
+        mov $r10 0x0
+        shl b32 $r10 $r10 0x10
+        or $r9 $r9 $r10
+        xdst $r5 $r9
+        xdwait
+        clear b32 $r5
+        mov $r9 0x280
+        or $r9 $r9 $r10
+        xdld $r5 $r9
+        xdwait
+        mov $r2 0x280
+        ld b32 $r3 D[$r2]
+        mov $r1 0x18
+        st b32 D[$r1] $r3
+
+// -- TLB -------------------------------------------------------------------
+// A code load maps a physical page to a virtual address; ptlb reads the entry
+// back, vtlb finds it by virtual address, and itlb invalidates it. The three
+// results are folded so that any one of them being wrong changes the word.
+        clear b32 $r1
+        mov $xcbase $r1
+        mov $r5 0x2200
+        mov $r9 0x1000
+        xcld $r5 $r9
+        xcwait
+        mov $r6 0x10
+        ptlb $r7 $r6
+        mov $r6 0x2200
+        vtlb $r8 $r6
+        xor $r7 $r7 $r8
+        mov $r6 0x10
+        itlb $r6
+        ptlb $r8 $r6
+        add b32 $r7 $r7 $r8
+        mov $r1 0x1c
+        st b32 D[$r1] $r7
+
 // -- fold everything into the final answer --------------------------------
+// Load every term from memory. An earlier version carried sum_sq in $r7
+// across the DMA and TLB sections, which both use $r7 -- so the fold silently
+// mixed in the TLB result twice and sum_sq not at all.
         mov $r1 0x4
         ld b32 $r3 D[$r1]
-        xor $r3 $r3 $r7
+        mov $r1 0x8
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
         mov $r1 0x10
         ld b32 $r4 D[$r1]
         xor $r3 $r3 $r4
         mov $r1 0x14
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
+        mov $r1 0x18
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
+        mov $r1 0x1c
         ld b32 $r4 D[$r1]
         xor $r3 $r3 $r4
         mov $r1 0xc

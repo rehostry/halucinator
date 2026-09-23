@@ -241,6 +241,10 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
             self._patch_arm_unimplemented_callothers()
         elif self.arch in self._HALT_CALLOTHERS:
             self._install_halt_callother(self._HALT_CALLOTHERS[self.arch])
+            if self.arch.startswith("falcon"):
+                self._install_falcon_xfer()
+                self._install_falcon_crypt(
+                    strict=bool(getattr(self, "strict_crypt", False)))
         elif self.arch in self._CALLOTHER_STUBS:
             self._patch_unimplemented_callothers(self._CALLOTHER_STUBS[self.arch])
 
@@ -1115,6 +1119,146 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
         "mips":        {"setISAMode"},
         "mipsel":      {"setISAMode"},
     }
+
+    def _install_falcon_crypt(self, strict: bool = False) -> None:
+        """Make Falcon's crypt coprocessor loud rather than quietly wrong.
+
+        It is not modelled, and deliberately so: envytools' crypt.rst is
+        "todo: write me" from top to bottom, and the RNN database gives the op
+        *names* only -- several of them literally UNK -- with no operand or
+        register conventions. There is nothing to implement it from, and a
+        guessed AES would produce confident wrong answers, which is worse than
+        no answer for the thing crypto is usually there to decide.
+
+        So every crypt op is recorded and reported instead of returning zero.
+        A rehost that touches signed-microcode paths (SEC2, GSP, PMU) can then
+        see that it did, rather than believing a signature check it never ran.
+        `strict` halts the core on the first one.
+
+        Neither shipped GP102 image -- FECS or GPCCS -- executes a single crypt
+        instruction, so this changes nothing for them.
+        """
+        import jpype  # type: ignore
+        from ghidra.pcode.emulate.callother import OpBehaviorOther  # type: ignore
+
+        backend = self
+        self.falcon_crypt_ops_seen: set = set()
+
+        @jpype.JImplements(OpBehaviorOther)
+        class _Crypt:
+            @jpype.JOverride
+            def evaluate(self, emu, out, inputs):
+                op = None
+                try:
+                    vals = list(inputs)
+                    if vals:
+                        op = int(emu.getMemoryState().getValue(vals[0]))
+                except Exception:  # noqa: BLE001
+                    pass
+                if op not in backend.falcon_crypt_ops_seen:
+                    backend.falcon_crypt_ops_seen.add(op)
+                    log.error(
+                        "Falcon crypt op %s executed and is NOT modelled "
+                        "(undocumented upstream); any result depending on it "
+                        "is not trustworthy", hex(op) if op is not None else "?")
+                if out is not None:
+                    emu.getMemoryState().setValue(out, 0)
+                if strict:
+                    backend._halted = True
+
+        for name in ("FalconCryptImm", "FalconCrypt"):
+            self._install_callother_stubs({name}, (), label=f"falcon:{name}",
+                                          behavior=_Crypt())
+
+    def _install_falcon_xfer(self, engine=None) -> None:
+        """Wire Falcon's DMA and TLB instructions to a real model.
+
+        These are the ops the processor module deliberately leaves inert: they
+        are device behaviour, and what they do depends on what the engine is
+        wired to. Attaching a FalconXferEngine here makes them real.
+
+        Operand order is taken from shipped firmware, not from the prose.
+        xfer.rst lists "Operands: SRC1, SRC2" against "Form: R2, R1", which
+        reads as SRC1=R2; GP102 FECS settles it the other way:
+
+            shl b32 $r12 $r6 0x10      ; size into bits 16+
+            or  $r9 $r4 $r12           ; local | size<<16
+            xdld $r5 $r9
+
+        so the *second* operand carries local_address|size<<16 -- it is SRC2 --
+        and the first is the external offset.
+        """
+        from halucinator.peripheral_models.falcon_xfer import FalconXferEngine
+        import jpype  # type: ignore
+        from ghidra.pcode.emulate.callother import OpBehaviorOther  # type: ignore
+
+        if engine is None:
+            engine = getattr(self, "falcon_xfer", None) or FalconXferEngine()
+        self.falcon_xfer = engine
+        backend = self
+
+        def _val(emu, vn):
+            return int(emu.getMemoryState().getValue(vn)) & 0xFFFFFFFF
+
+        def behavior(fn, writes_result=False):
+            @jpype.JImplements(OpBehaviorOther)
+            class _B:
+                @jpype.JOverride
+                def evaluate(self, emu, out, inputs):
+                    try:
+                        # Ghidra hands OpBehaviorOther the operands directly;
+                        # the userop index is not among them.
+                        args = [_val(emu, v) for v in list(inputs)]
+                        res = fn(*args)
+                    except Exception:  # noqa: BLE001
+                        log.exception("Falcon xfer/TLB op failed")
+                        res = 0
+                    if writes_result and out is not None:
+                        emu.getMemoryState().setValue(out, int(res or 0))
+            return _B()
+
+        def targets():
+            return backend.read_register("xtargets")
+
+        def xdld(src1, src2):
+            return engine.data_load(backend, (targets() >> 8) & 7,
+                                    backend.read_register("xdbase"),
+                                    src1, src2 & 0xFFFF, (src2 >> 16) & 7)
+
+        def xdst(src1, src2):
+            return engine.data_store(backend, (targets() >> 12) & 7,
+                                     backend.read_register("xdbase"),
+                                     src1, src2 & 0xFFFF, (src2 >> 16) & 7)
+
+        def xcld(src1, src2):
+            # xfer.rst: the secret flag comes from $cauth bit 16.
+            try:
+                secret = bool((backend.read_register("cauth") >> 16) & 1)
+            except Exception:  # noqa: BLE001
+                secret = False
+            return engine.code_load(backend, targets() & 7,
+                                    backend.read_register("xcbase"),
+                                    src1, src2 & 0xFFFF, secret)
+
+        ops = {
+            "FalconXdLd":  (xdld, False),
+            "FalconXdSt":  (xdst, False),
+            "FalconXcLd":  (xcld, False),
+            "FalconPtlb":  (engine.ptlb, True),
+            "FalconVtlb":  (engine.vtlb, True),
+            "FalconItlb":  (lambda p: engine.itlb(p), False),
+            # Transfers complete inside the instruction, so by the time a wait
+            # runs the queue is genuinely empty. These are no-ops because the
+            # model makes them true, not because they are being skipped.
+            "FalconXdWait":  (lambda: None, False),
+            "FalconXcWait":  (lambda: None, False),
+            "FalconXdFence": (lambda: None, False),
+        }
+        for name, (fn, writes) in ops.items():
+            self._install_callother_stubs({name}, (), label=f"falcon:{name}",
+                                          behavior=behavior(fn, writes))
+        log.info("GhidraBackend: Falcon DMA + TLB modelled (%d ports declared)",
+                 len(engine.ports))
 
     def _install_halt_callother(self, names) -> None:
         """Make the named pcodeops halt the backend instead of completing.

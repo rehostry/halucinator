@@ -9,6 +9,12 @@ N_IRQ = 8      # the firmware waits for exactly this many interrupts
 TERMS = 64     # sum of squares over 1..TERMS
 
 IRQ_COUNT, MIX, SUM_SQ, DONE, ALU, REGS = 0x00, 0x04, 0x08, 0x0C, 0x10, 0x14
+DMA, TLB = 0x18, 0x1C
+
+# The code page the harness places in external port 0, and where.
+CODE_PAGE_EXT_OFF = 0x2200
+CODE_PAGE_PHYS = 0x1000          # IMEM byte address -> physical page 0x10
+DMA_PATTERN = 0x5EED0042
 
 
 def _s32(v):
@@ -55,24 +61,43 @@ def _alu():
     return r6
 
 
+def _tlb():
+    """vm.rst, folded the way the firmware folds it.
+
+    ptlb(phys)  = flags << 24 | virt << 8
+    vtlb(virt)  = phys | flags << 24          (bit 31 if no match)
+    then itlb(phys) clears it, so the second ptlb reads 0.
+    """
+    phys = CODE_PAGE_PHYS // 0x100                     # 0x10
+    virt = (CODE_PAGE_EXT_OFF >> 8) & 0xFFFF           # 0x22
+    flags = 0x1                                        # usable, not secret
+    ptlb = ((flags << 24) | (virt << 8)) & M32
+    vtlb = (phys | (flags << 24)) & M32
+    return ((ptlb ^ vtlb) + 0) & M32                   # + ptlb-after-itlb (0)
+
+
 def expected():
-    """The four-plus-two words the firmware must leave in DMEM."""
+    """Every word the firmware must leave in DMEM."""
     sum_sq, mix, alu = _sum_sq(), _mix(), _alu()
     # r0..r3 = 0x11,0x22,0x33,0x44 must survive `clobber`, which saves them
     # with `mpush $r4` and then overwrites all four.
     regs = 0x11223344
+    dma = DMA_PATTERN          # written to DMEM, pushed out by xdst, read back
+    tlb = _tlb()
     return {
         "irq_count": N_IRQ,
         "mix": mix,
         "sum_sq": sum_sq,
         "alu": alu,
         "regs": regs,
-        "done": mix ^ sum_sq ^ alu ^ regs,
+        "dma": dma,
+        "tlb": tlb,
+        "done": mix ^ sum_sq ^ alu ^ regs ^ dma ^ tlb,
     }
 
 
 OFFSETS = {"irq_count": IRQ_COUNT, "mix": MIX, "sum_sq": SUM_SQ,
-           "done": DONE, "alu": ALU, "regs": REGS}
+           "done": DONE, "alu": ALU, "regs": REGS, "dma": DMA, "tlb": TLB}
 
 if __name__ == "__main__":
     for k, v in expected().items():
