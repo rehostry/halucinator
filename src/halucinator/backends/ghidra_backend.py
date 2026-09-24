@@ -89,6 +89,7 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
         # Set by a halting pcodeop (Falcon `exit`); step()/cont() honour it.
         self._halted = False
         self._halt_pc: Optional[int] = None
+        self._step_fault_pc: Optional[int] = None
         self._regions: List[MemoryRegion] = []
         self._breakpoints: Dict[int, int] = {}  # addr -> bp_id
         # Watchpoints: bp_id -> (addr, size, read, write)
@@ -1195,6 +1196,7 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
         if engine is None:
             engine = getattr(self, "falcon_xfer", None) or FalconXferEngine()
         self.falcon_xfer = engine
+        self.falcon_xfer_errors: List[str] = []
         backend = self
 
         def _val(emu, vn):
@@ -1210,8 +1212,11 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
                         # the userop index is not among them.
                         args = [_val(emu, v) for v in list(inputs)]
                         res = fn(*args)
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
+                        # Logging alone still hands the guest a zero and lets
+                        # it carry on. Record it so a run can be rejected.
                         log.exception("Falcon xfer/TLB op failed")
+                        backend.falcon_xfer_errors.append(repr(exc))
                         res = 0
                     if writes_result and out is not None:
                         emu.getMemoryState().setValue(out, int(res or 0))
@@ -1230,12 +1235,22 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
                                      backend.read_register("xdbase"),
                                      src1, src2 & 0xFFFF, (src2 >> 16) & 7)
 
+        try:
+            self.read_register("cauth")
+            self._has_cauth = True
+        except Exception:  # noqa: BLE001
+            # No $cauth on this variant, so no secret-code-load flag exists to
+            # read. Say it once here rather than silently answering "not
+            # secret" on every code load: a page loaded as non-secret gets
+            # different TLB flags and becomes clearable by ITLB.
+            self._has_cauth = False
+            log.info("GhidraBackend: no $cauth on %s; code loads are treated "
+                     "as non-secret", self.arch)
+
         def xcld(src1, src2):
             # xfer.rst: the secret flag comes from $cauth bit 16.
-            try:
-                secret = bool((backend.read_register("cauth") >> 16) & 1)
-            except Exception:  # noqa: BLE001
-                secret = False
+            secret = (bool((backend.read_register("cauth") >> 16) & 1)
+                      if backend._has_cauth else False)
             return engine.code_load(backend, targets() & 7,
                                     backend.read_register("xcbase"),
                                     src1, src2 & 0xFFFF, secret)

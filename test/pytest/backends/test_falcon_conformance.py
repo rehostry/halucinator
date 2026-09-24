@@ -172,7 +172,7 @@ def test_exactly_one_handler_entry_per_expiry(run):
 
 def test_no_instruction_wedged_the_emulator(run):
     be, _, _ = run
-    assert getattr(be, "_step_fault_pc", None) is None
+    assert be._step_fault_pc is None
 
 
 def test_without_a_timer_nothing_is_produced():
@@ -212,7 +212,7 @@ def test_fuc4_took_its_interrupts(run4):
 
 def test_fuc4_did_not_wedge(run4):
     be, _, _ = run4
-    assert getattr(be, "_step_fault_pc", None) is None
+    assert be._step_fault_pc is None
 
 
 def test_the_dma_round_trip(run):
@@ -245,4 +245,143 @@ def test_no_crypt_was_executed(run):
     the run. Nothing in this firmware -- or in either shipped GP102 image --
     touches it."""
     be, _, _ = run
-    assert not getattr(be, "falcon_crypt_ops_seen", set())
+    # Assert the handler exists before asserting it saw nothing: `getattr(...,
+    # set())` passes just as happily when crypt handling was never installed,
+    # which is a pass that means the opposite of what it looks like.
+    assert hasattr(be, "falcon_crypt_ops_seen"), "crypt handler not installed"
+    assert not be.falcon_crypt_ops_seen
+
+
+def test_no_transfer_or_tlb_op_failed(run):
+    """A DMA/TLB op that raises is logged and then hands the guest a zero.
+
+    The log is not enough on its own -- the firmware carries on with a wrong
+    value and the run still looks finished. The errors are recorded so a run
+    can be rejected outright.
+    """
+    be, _, _ = run
+    assert hasattr(be, "falcon_xfer_errors"), "xfer engine not installed"
+    assert be.falcon_xfer_errors == []
+
+
+def test_the_carry_chained_instructions(run):
+    """adc, sbb, shlc, div and mod -- none of which anything had executed.
+
+    adc and sbb consume a carry produced two instructions earlier, so this also
+    pins that `mov` leaves the flags alone (arith.rst: mov is the one unary
+    that sets none) and that the sized `add b8` sets carry from bit 7.
+    """
+    _, _, got = run
+    assert got["carry"] == oracle._carry()
+
+
+def test_rotate_through_carry_and_setp(run):
+    """shrc shifts the carry into the top bit; setp writes a flag bit directly.
+
+    setp's 0xf2 form takes its flag selector from a third byte the constructor
+    used not to consume, so this is also the regression test for that.
+    """
+    _, _, got = run
+    assert got["rotc"] == oracle._rotc()
+
+
+def test_mpop_and_mpopadd(run):
+    """The other half of the derived multi-register family.
+
+    mpopadd also moves $sp by its immediate, so the value only comes back if
+    the pop count and the adjustment are both right.
+    """
+    _, _, got = run
+    assert got["multi"] == oracle._multi()
+
+
+def test_a_software_trap_is_delivered_and_returns(run):
+    """trap pushes $pc, sets $tstatus to `pc | reason << 20`, jumps to $tv.
+
+    All four trap constructors were a FalconTrap() pcodeop -- a black box that
+    faults an emulator -- until this session. Nothing had executed one.
+    """
+    _, _, got = run
+    assert got["trapw"] == oracle._trapw()
+
+
+def test_the_remaining_arithmetic(run):
+    """sub, cmp's zero flag, muls' signed multiply, and extr's bitfield."""
+    _, _, got = run
+    assert got["misc"] == oracle._misc()
+
+
+def test_iord_extrs_and_a_far_call(run):
+    """iord reads back what iowr wrote; extrs sign-extends where extr does
+    not; and a far callee returning through mpopaddret leaves r0 intact."""
+    _, _, got = run
+    assert got["misc2"] == oracle._misc2()
+
+
+def test_signed_and_unsigned_compare_differ(run):
+    """cmps and cmpu on the same operands must disagree.
+
+    If cmps were implemented as an unsigned compare -- which it was, before the
+    flag sets were brought in line with arith.rst -- both would answer the same
+    and this word would change.
+    """
+    _, _, got = run
+    assert got["signed"] == oracle._signed()
+
+
+# -- coverage ratchet -------------------------------------------------------
+
+# Instructions the module implements that nothing executes. Every entry here
+# is semantics no test can catch being wrong -- which is exactly how six
+# constructors briefly negated the destination instead of the source, and how
+# `setp` decoded two bytes where it needed three.
+#
+# crypt is excluded: it is deliberately unmodelled (crypt.rst is "todo: write
+# me" throughout), so executing it would prove nothing.
+KNOWN_UNEXECUTED = {
+    "ins",      # bitfield insert; envyas rejects every operand form tried
+    "iords",    # I/O read with shift
+    "iowrs",    # I/O write with shift
+}
+
+
+def test_no_new_instruction_goes_unexecuted():
+    """Ratchet: the set of never-executed instructions must not grow.
+
+    Adding a constructor without anything that runs it is how a semantic
+    defect survives a green suite.
+    """
+    import re
+    import shutil
+    import subprocess
+
+    envydis = None
+    for cand in (pathlib.Path.home() / "Development/envytools/build/envydis/envydis",
+                 pathlib.Path.home() / ".envytools-cache/envytools/build/envydis/envydis"):
+        if cand.is_file():
+            envydis = str(cand)
+            break
+    envydis = envydis or shutil.which("envydis")
+    if not envydis:
+        pytest.skip("envydis not available")
+    langdir = pathlib.Path(os.environ.get("GHIDRA_INSTALL_DIR", "")) /         "Ghidra/Processors/Falcon/data/languages"
+    if not langdir.is_dir():
+        pytest.skip("Falcon processor module not installed")
+
+    def mnemonics(binary):
+        out = re.sub(r"\x1b\[[0-9;]*m", "", subprocess.run(
+            [envydis, "-m", "falcon", "-V", "fuc5", "-i", str(binary)],
+            capture_output=True, text=True).stdout)
+        return {m.group(1) for m in (re.match(
+            r"^[0-9a-f]{8}:\s+(?:[0-9a-f]{2} )+\s*(?:[A-Z]{1,2}\s+)?([a-z][a-z0-9]*)\b",
+            l.strip()) for l in out.splitlines()) if m}
+
+    executed = mnemonics(FW) | mnemonics(FW4)
+    sinc = " ".join(f.read_text() for f in langdir.glob("*.sinc"))
+    implemented = set(re.findall(r"^:([a-z][a-z0-9]*)", sinc, re.M))
+    crypt = {m for m in implemented if m.startswith("ci")}
+    unexecuted = implemented - executed - crypt - KNOWN_UNEXECUTED
+    assert not unexecuted, (
+        f"{len(unexecuted)} instruction(s) implemented but executed by no "
+        f"test firmware: {sorted(unexecuted)}. Add them to the conformance "
+        f"firmware, or to KNOWN_UNEXECUTED with a reason.")

@@ -12,11 +12,14 @@
 //   0x00 irq_count   must be exactly 8
 //   0x04 mix         mix = ((mix & 0xffff) * 31 + k) for k = 1..8, in order
 //   0x08 sum_sq      sum of i*i for i = 1..64, computed through call/ret
-//   0x0c done        mix ^ sum_sq ^ alu ^ regs ^ dma ^ tlb, written last
+//   0x0c done        every other word XORed together, written last
 //   0x10 alu         a chain over and/or/xor/shl/sar/hswap/xbit/sext/not/neg
 //   0x14 regs        proof that `mpush $r4` really preserved r0-r3
 //   0x18 dma         a DMEM -> external -> DMEM round trip through xdst/xdld
 //   0x1c tlb         ptlb/vtlb/itlb after a code load, folded together
+//   0x20 sized       b8/b16 arithmetic must wrap, and set flags from bit sz-1
+//   0x24 carry        adc/sbb/shlc/div/mod -- all rewritten or never executed
+//   0x28 rotc         shrc, and setp writing a flag bit
 
 // -- init ------------------------------------------------------------------
         mov $r0 0x1000
@@ -38,6 +41,22 @@
         mov $r1 0x18
         st b32 D[$r1] $r0
         mov $r1 0x1c
+        st b32 D[$r1] $r0
+        mov $r1 0x20
+        st b32 D[$r1] $r0
+        mov $r1 0x24
+        st b32 D[$r1] $r0
+        mov $r1 0x28
+        st b32 D[$r1] $r0
+        mov $r1 0x2c
+        st b32 D[$r1] $r0
+        mov $r1 0x30
+        st b32 D[$r1] $r0
+        mov $r1 0x34
+        st b32 D[$r1] $r0
+        mov $r1 0x38
+        st b32 D[$r1] $r0
+        mov $r1 0x3c
         st b32 D[$r1] $r0
 
 // -- install the handler ---------------------------------------------------
@@ -188,6 +207,188 @@ sumloop:
         mov $r1 0x1c
         st b32 D[$r1] $r7
 
+// -- sized arithmetic ------------------------------------------------------
+// A sized instruction computes in sz bits and takes its flags from bit sz-1
+// (arith.rst: S(x) is `x >> (sz-1) & 1`). Values are chosen so their upper
+// bits are already zero, so this checks the wrapping and the flags without
+// depending on what a sized write does to the destination's high bits --
+// which the documentation does not state.
+        mov $r1 0xff
+        mov $r2 0x2
+        add b8 $r1 $r2                  // 0xff + 2 -> 0x01 in 8 bits, carry
+        xbit $r3 $flags c             // c
+        mov $r4 0xffff
+        mov $r5 0x1
+        add b16 $r4 $r5                 // 0xffff + 1 -> 0 in 16 bits, zero+carry
+        xbit $r6 $flags z             // z
+        shl b32 $r3 $r3 0x8
+        or $r1 $r1 $r3
+        shl b32 $r6 $r6 0xc
+        or $r1 $r1 $r6
+        shl b32 $r4 $r4 0x10
+        or $r1 $r1 $r4
+        mov $r2 0x20
+        st b32 D[$r2] $r1
+
+// -- instructions nothing had ever executed --------------------------------
+// A coverage count of the conformance firmware against the shipped images
+// showed 16 non-crypt instructions that no test and neither GP102 image ever
+// ran -- including adc, sbb, shlc and shrc, which had just been rewritten for
+// the sized-operand fix. `mov` sets no flags on v3+, so the carry set below
+// survives to the instruction that consumes it.
+        mov $r1 0xff
+        mov $r2 0x1
+        add b8 $r1 $r2                  // 0xff + 1 -> 0 in 8 bits, carry out
+        mov $r3 0x10
+        mov $r4 0x20
+        adc b32 $r3 $r4                 // 0x10 + 0x20 + carry = 0x31
+        mov $r5 0x50
+        mov $r6 0x20
+        cmpu b32 $r5 $r6                // 0x50 >= 0x20, so no borrow
+        sbb b32 $r5 $r6                 // 0x50 - 0x20 - 0 = 0x30
+        bset $flags c
+        mov $r7 0x1
+        mov $r8 0x1
+        shlc b32 $r7 $r8                // (1 << 1) | carry = 3
+        mov $r11 0x64
+        div $r12 $r11 0x7               // 100 / 7 = 14
+        mod $r13 $r11 0x7               // 100 % 7 = 2
+        shl b32 $r5 $r5 0x8
+        or $r3 $r3 $r5
+        shl b32 $r7 $r7 0x10
+        or $r3 $r3 $r7
+        shl b32 $r12 $r12 0x18
+        or $r3 $r3 $r12
+        shl b32 $r13 $r13 0x1c
+        or $r3 $r3 $r13
+        mov $r1 0x24
+        st b32 D[$r1] $r3
+
+// rotate-through-carry the other way, then setp writing a flag bit directly
+        bset $flags c
+        mov $r9 0x2
+        mov $r10 0x1
+        shrc b32 $r9 $r10               // (2 >> 1) | (carry << 31)
+        mov $r14 0x1
+        setp c $r14                     // flags.c := 1
+        xbit $r15 $flags c
+        shl b32 $r15 $r15 0x1
+        xor $r9 $r9 $r15
+        mov $r1 0x28
+        st b32 D[$r1] $r9
+
+// -- mpop and mpopadd ------------------------------------------------------
+// mpush/mpopret are already tested; these two are the other half of a
+// derived, undocumented family. mpopadd additionally moves $sp by its
+// immediate, so the value is only recovered if both the pop and the
+// adjustment are right.
+        mov $r0 0xa1
+        mov $r1 0xb2
+        mpush $r2                       // saves r0, r1
+        mov $r0 0xee
+        mov $r1 0xee
+        mpop $r2                        // restores both
+        shl b32 $r1 $r1 0x8
+        or $r5 $r0 $r1                  // 0xb2a1 if mpop restored them
+
+// mpopadd pops and *then* adds, so the bytes it reclaims sit above the saved
+// block, not below it -- that is the caller-pushed-argument pattern GP102
+// FECS uses. An earlier version of this allocated the frame after the mpush
+// and the pop read from the wrong place.
+        add $sp -0x8                    // caller's two argument words
+        mov $r0 0xc3
+        mpush $r1                       // saves r0
+        mov $r0 0xee
+        mpopadd $r1 0x8                 // pop r0, then reclaim the 8 bytes
+        shl b32 $r0 $r0 0x10
+        or $r5 $r5 $r0                  // 0xc3b2a1
+        mov $r1 0x2c
+        st b32 D[$r1] $r5
+
+// -- a software trap -------------------------------------------------------
+// intr.rst gives the delivery sequence: push $pc, save and clear the enables,
+// set $tstatus to the faulting pc plus the reason, and jump to $tv.
+        mov $r1 #traphandler
+        mov $tv $r1
+        clear b32 $r6
+        trap 0x1
+        mov $r1 0x30
+        st b32 D[$r1] $r6
+
+// -- signed vs unsigned compare -------------------------------------------
+// arith.rst: cmps sets c "in an unusual way to enable signed comparisons
+// while using unsigned flags and condition codes", so after cmps the carry
+// answers signed less-than. Comparing -1 with 1 separates the two readings:
+// signed says less, unsigned says greater. Both set only c and z.
+        mov $r1 0x1
+        neg b32 $r1 $r1                 // -1
+        mov $r2 0x1
+        cmps b32 $r1 $r2                // signed: -1 < 1  -> c = 1
+        xbit $r3 $flags c
+        cmpu b32 $r1 $r2                // unsigned: huge > 1 -> c = 0
+        xbit $r4 $flags c
+        bclr $flags c
+        btgl $flags c                   // -> c = 1
+        xbit $r5 $flags c
+        xdfence
+        shl b32 $r4 $r4 0x1
+        or $r3 $r3 $r4
+        shl b32 $r5 $r5 0x2
+        or $r3 $r3 $r5
+        mov $r1 0x34
+        st b32 D[$r1] $r3
+
+// -- the last instructions with no exact-answer test -----------------------
+// These are all executed by the shipped GP102 images, which is weaker
+// evidence than it sounds: running without crashing is not the same as
+// producing a value anyone checked.
+        mov $r1 0x50
+        mov $r2 0x30
+        sub b32 $r1 $r2                 // 0x20
+        mov $r3 0x10
+        cmp b32 $r3 $r3                 // equal, so z
+        xbit $r4 $flags z
+        mov $r5 0x2
+        neg b32 $r5 $r5                 // -2
+        mov $r6 0x3
+        muls $r7 $r5 $r6                // signed 16x16 -> -6
+        mov $r8 0xabcd
+        mov $r9 0x64                    // position 4, width 4
+        extr $r10 $r8 $r9               // (0xabcd >> 4) & 0xf = 0xc
+        shl b32 $r4 $r4 0x8
+        or $r1 $r1 $r4
+        and $r7 $r7 $r2                 // keep a byte of the negative result
+        shl b32 $r7 $r7 0x10
+        or $r1 $r1 $r7
+        shl b32 $r10 $r10 0x18
+        or $r1 $r1 $r10
+        mov $r2 0x38
+        st b32 D[$r2] $r1
+
+// extrs sign-extends the field it pulls out, so bit 31 separates it from extr
+        mov $r8 0xabcd
+        mov $r9 0x64
+        extrs $r11 $r8 $r9              // 0xc sign-extended from bit 3
+        shr b32 $r11 $r11 0x1f          // -> 1
+// iord must read back what iowr wrote
+        mov $r12 0x800
+        mov $r13 0x1234
+        iowr I[$r12] $r13
+        iord $r14 I[$r12]               // -> 0x1234
+        sleep c
+// a far call whose callee returns through mpopaddret
+        add $sp -0x8
+        mov $r0 0x77
+        lcall #farroutine
+        shl b32 $r0 $r0 0x10
+        or $r14 $r14 $r0
+        shl b32 $r11 $r11 0x18
+        or $r14 $r14 $r11
+        mov $r2 0x3c
+        st b32 D[$r2] $r14
+        lbra #afterfar
+afterfar:
+
 // -- fold everything into the final answer --------------------------------
 // Load every term from memory. An earlier version carried sum_sq in $r7
 // across the DMA and TLB sections, which both use $r7 -- so the fold silently
@@ -209,9 +410,60 @@ sumloop:
         mov $r1 0x1c
         ld b32 $r4 D[$r1]
         xor $r3 $r3 $r4
+        mov $r1 0x20
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
+        mov $r1 0x24
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
+        mov $r1 0x28
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
+        mov $r1 0x2c
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
+        mov $r1 0x30
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
+        mov $r1 0x34
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
+        mov $r1 0x38
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
+        mov $r1 0x3c
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
         mov $r1 0xc
         st b32 D[$r1] $r3
         exit
+
+// -- a callee that returns through mpopaddret ------------------------------
+// The caller allocates two argument words before the call; mpopaddret pops
+// the saved registers and then reclaims them, which is the shape GP102 FECS
+// uses at 0x1be1.
+farroutine:
+        mpush $r1                       // saves r0
+        mov $r0 0xee
+        mpopaddret $r1 0x8
+
+// -- trap handler: record the reason from $tstatus, then return ------------
+// $tstatus is `faulting pc | reason << 20`. Keeping only the reason makes the
+// check independent of where the trap instruction happens to sit.
+traphandler:
+        mov $r7 $tstatus
+        shr b32 $r7 $r7 0x14
+        mov $r6 0x1
+        shl b32 $r6 $r6 0x8
+        or $r6 $r6 $r7                  // 0x100 | reason
+// intr.rst pushes the *faulting* pc, not the one after it, so returning
+// straight away re-executes the trap and loops forever. Stepping the stacked
+// address over the 2-byte `trap` is the handler's job, and doing it here also
+// puts the pushed value itself under test.
+        pop $r8
+        add b32 $r8 $r8 0x2
+        push $r8
+        iret
 
 // -- saves r0-r3 via mpush, destroys them, restores them on the way out ----
 clobber:
