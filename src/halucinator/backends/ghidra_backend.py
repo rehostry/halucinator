@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import is_dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from .hal_backend import (
@@ -1024,20 +1025,28 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
                             "peripheral IRQs cannot be taken", self.arch)
                 self.auto_deliver_peripheral_irqs = False
                 return False
+        from .irq.delivery import DeliveryPlan
+        base_plan = getattr(self, "peripheral_irq_plan", None) or DeliveryPlan()
         for _base, per, _live, _shadow in getattr(self, "_mmio_live", ()):
             pending = getattr(per, "pending_and_enabled", None)
             if not callable(pending):
                 continue
-            bits = pending()
-            if not bits:
-                continue
-            num = (bits & -bits).bit_length() - 1      # lowest-numbered line
-            plan = getattr(self, "peripheral_irq_plan", None)
-            if plan is None:
-                from .irq.delivery import DeliveryPlan
-                plan = DeliveryPlan()
-            if deliverer.deliver(self, num, plan):
-                return True
+            # Ask per vector where the peripheral models interrupt routing, so
+            # a line the firmware routed to vector 1 is delivered there and a
+            # line routed to the host is not delivered here at all. Peripherals
+            # without routing answer once, as before.
+            try:
+                per_vector = [(v, pending(vector=v)) for v in (0, 1)]
+            except TypeError:
+                per_vector = [(base_plan.falcon_vector, pending())]
+            for vector, bits in per_vector:
+                if not bits:
+                    continue
+                num = (bits & -bits).bit_length() - 1   # lowest-numbered line
+                plan = replace(base_plan, falcon_vector=vector) \
+                    if is_dataclass(base_plan) else base_plan
+                if deliverer.deliver(self, num, plan):
+                    return True
         return False
 
     def _patch_arm_setISAMode(self) -> None:

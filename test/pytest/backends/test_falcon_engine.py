@@ -5,7 +5,8 @@ import pytest
 
 from halucinator.peripheral_models.falcon_engine import (
     DEFAULT_READY_BITS, ENGINE_STATUS, FalconEngine, INTR, INTR_CLEAR,
-    INTR_EN, INTR_EN_CLEAR, INTR_EN_SET, INTR_SET, LINE_PERIODIC,
+    INTR_EN, INTR_EN_CLEAR, INTR_EN_SET, INTR_MODE, INTR_ROUTING,
+    INTR_SET, LINE_PERIODIC,
     LINE_WATCHDOG, MAILBOX_REQ, MAILBOX_RESP, PERIODIC_ENABLE,
     PERIODIC_PERIOD, PERIODIC_TIME, TIME_LOW, WATCHDOG_ENABLE, WATCHDOG_TIME,
 )
@@ -165,3 +166,46 @@ def test_timer_line_only_counts_as_pending_when_enabled(eng):
     assert eng.pending_and_enabled() == 0                  # raised, not enabled
     eng.hw_write(INTR_EN_SET, 4, 1 << LINE_PERIODIC)
     assert eng.pending_and_enabled() == 1 << LINE_PERIODIC
+
+
+# -- INTR_MODE and INTR_ROUTING --------------------------------------------
+#
+# Both shipped GP102 images program both registers, so neither can be the
+# constant it used to be: the level-trigger mask was hardcoded to the reset
+# value and routing was ignored entirely, which sends every line to vector 0.
+
+def test_intr_mode_reads_its_reset_value(eng):
+    """intr.rst: INTR_MODE is 0xfc04 out of reset."""
+    assert eng.hw_read(INTR_MODE, 4) == 0xFC04
+
+
+def test_intr_mode_is_writable_and_gates_set_and_clear(eng):
+    """SET and CLEAR are ignored for level-triggered lines, and which lines
+    are level-triggered is whatever the firmware last wrote."""
+    eng.hw_write(INTR_MODE, 4, 0x0000)          # every line edge-triggered
+    eng.hw_write(INTR_SET, 4, 0x0004)
+    assert eng.hw_read(INTR, 4) == 0x0004       # line 2 now settable
+    eng.hw_write(INTR_MODE, 4, 0x0004)          # line 2 back to level
+    eng.hw_write(INTR_CLEAR, 4, 0x0004)
+    assert eng.hw_read(INTR, 4) == 0x0004       # and no longer clearable
+
+
+def test_routing_splits_lines_between_the_two_vectors(eng):
+    eng.hw_write(INTR_EN_SET, 4, 0xFFFF)
+    eng.raise_line(0)
+    eng.raise_line(1)
+    # line 1 -> vector 1 (route 2 = high bit only), line 0 stays on vector 0
+    eng.hw_write(INTR_ROUTING, 4, 1 << (16 + 1))
+    assert eng.pending_and_enabled(vector=0) == 1 << 0
+    assert eng.pending_and_enabled(vector=1) == 1 << 1
+
+
+def test_a_line_routed_to_the_host_reaches_neither_vector(eng):
+    """Routes 1 and 3 go to PMC. The microcontroller never sees them, so
+    delivering one into a handler would invent an interrupt."""
+    eng.hw_write(INTR_EN_SET, 4, 0xFFFF)
+    eng.raise_line(3)
+    eng.hw_write(INTR_ROUTING, 4, 1 << 3)        # low bit only -> PMC HOST
+    assert eng.pending_and_enabled() == 1 << 3   # pending, as hardware would
+    assert eng.pending_and_enabled(vector=0) == 0
+    assert eng.pending_and_enabled(vector=1) == 0

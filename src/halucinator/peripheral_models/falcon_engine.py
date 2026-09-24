@@ -57,7 +57,18 @@ log = logging.getLogger(__name__)
 
 # Interrupt controller
 INTR_SET, INTR_CLEAR, INTR = 0x00000, 0x00100, 0x00200
+INTR_MODE = 0x00300
 INTR_EN_SET, INTR_EN_CLEAR, INTR_EN = 0x00400, 0x00500, 0x00600
+INTR_ROUTING = 0x00700
+
+# intr.rst: INTR_MODE bits 0-15 are per-line trigger modes, 0 edge and 1
+# level, and the register reads 0xfc04 out of reset.
+INTR_MODE_RESET = 0xFC04
+
+# intr.rst: a line's routing is two bits, taken from bit N of each half of
+# INTR_ROUTING. 0 and 2 are the falcon's own vectors; 1 and 3 go to the host
+# and never reach the microcontroller at all.
+ROUTE_VECTOR0, ROUTE_PMC_HOST, ROUTE_VECTOR1, ROUTE_PMC_NRHOST = 0, 1, 2, 3
 
 # Timers (docs/hw/falcon/timer.rst)
 PERIODIC_PERIOD, PERIODIC_TIME, PERIODIC_ENABLE = 0x00800, 0x00900, 0x00A00
@@ -87,7 +98,7 @@ class FalconEngine(AvatarPeripheral):
     def __init__(self, name: str, address: int, size: int,
                  registers: Optional[Dict[int, int]] = None,
                  ready_bits: int = DEFAULT_READY_BITS,
-                 level_lines: int = 0,
+                 level_lines: Optional[int] = None,
                  cycles_per_step: int = 1,
                  **kwargs: Any) -> None:
         AvatarPeripheral.__init__(self, name, address, size)
@@ -96,7 +107,11 @@ class FalconEngine(AvatarPeripheral):
         # Lines wired level-triggered; SET/CLEAR writes to these are ignored.
         # Defaults match intr.rst: line 2 (FIFO) plus the engine-specific
         # 10..15 range.
-        self.level_lines = level_lines or ((1 << 2) | (0x3F << 10))
+        # Both shipped GP102 images program INTR_MODE and INTR_ROUTING, so
+        # neither can be a constant here. level_lines is kept as a constructor
+        # override for tests; otherwise it tracks INTR_MODE.
+        self.intr_mode = INTR_MODE_RESET if level_lines is None else level_lines
+        self.intr_routing = 0
         self.intr = 0
         self.intr_en = 0
         self._pending_req = 0
@@ -124,6 +139,7 @@ class FalconEngine(AvatarPeripheral):
         """
         return (INTR, INTR_EN, ENGINE_STATUS, MAILBOX_REQ, MAILBOX_RESP,
                 INTR_SET, INTR_CLEAR, INTR_EN_SET, INTR_EN_CLEAR,
+                INTR_MODE, INTR_ROUTING,
                 PERIODIC_PERIOD, PERIODIC_TIME, PERIODIC_ENABLE,
                 WATCHDOG_TIME, WATCHDOG_ENABLE, TIME_LOW, TIME_HIGH)
 
@@ -177,8 +193,30 @@ class FalconEngine(AvatarPeripheral):
         """Make line `num` pending, as the engine's own hardware would."""
         self.intr |= 1 << num
 
-    def pending_and_enabled(self) -> int:
-        return self.intr & self.intr_en
+    def route_of(self, line: int) -> int:
+        """intr.rst: a line's two routing bits come from bit N of each half."""
+        lo = (self.intr_routing >> line) & 1
+        hi = (self.intr_routing >> (16 + line)) & 1
+        return lo | (hi << 1)
+
+    def pending_and_enabled(self, vector: Optional[int] = None) -> int:
+        """Lines that are pending and unmasked.
+
+        With `vector`, only the lines INTR_ROUTING sends to that falcon vector.
+        Lines routed to the host (PMC) are excluded from both: they never reach
+        the microcontroller, so delivering them into a handler would invent an
+        interrupt the core would never see. Both shipped GP102 images program
+        INTR_ROUTING, so this is not hypothetical.
+        """
+        live = self.intr & self.intr_en
+        if vector is None:
+            return live
+        want = ROUTE_VECTOR0 if vector == 0 else ROUTE_VECTOR1
+        out = 0
+        for line in range(16):
+            if (live >> line) & 1 and self.route_of(line) == want:
+                out |= 1 << line
+        return out
 
     # -- MMIO --------------------------------------------------------------
 
@@ -188,6 +226,10 @@ class FalconEngine(AvatarPeripheral):
             return self.intr
         if offset == INTR_EN:
             return self.intr_en
+        if offset == INTR_MODE:
+            return self.intr_mode
+        if offset == INTR_ROUTING:
+            return self.intr_routing
         if offset == ENGINE_STATUS:
             # Always ready: there is no modelled latency, and a poll that can
             # never succeed is indistinguishable from a hung rehost.
@@ -223,13 +265,17 @@ class FalconEngine(AvatarPeripheral):
     def hw_write(self, offset: int, size: int, value: int,
                  pc: int = 0xBAADBAAD, **kwargs: Any) -> bool:
         if offset == INTR_SET:
-            self.intr |= value & ~self.level_lines
+            self.intr |= value & ~self.intr_mode
         elif offset == INTR_CLEAR:
-            self.intr &= ~(value & ~self.level_lines)
+            self.intr &= ~(value & ~self.intr_mode)
         elif offset == INTR_EN_SET:
             self.intr_en |= value
         elif offset == INTR_EN_CLEAR:
             self.intr_en &= ~value
+        elif offset == INTR_MODE:
+            self.intr_mode = value & 0xFFFF
+        elif offset == INTR_ROUTING:
+            self.intr_routing = value & 0xFFFFFFFF
         elif offset == PERIODIC_PERIOD:
             self.periodic_period = value
         elif offset == PERIODIC_TIME:
