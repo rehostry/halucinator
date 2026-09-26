@@ -15,8 +15,16 @@ memories:
          size: 0x8000}
   # DMEM: data + stack.
   dmem: {base_addr: 0x0, size: 0x4000, permissions: rw, space: dmem}
-  # Engine MMIO.  The io space the module declares; modelled here as memory
-  # so peripheral handlers can be attached to ranges within it.
-  io:   {base_addr: 0x0, size: 0x40000, permissions: rw, space: io}
+  # Engine MMIO. `emulate:` attaches the engine model, which is what supplies
+  # engine status, the interrupt set/clear/status triples, INTR_MODE and
+  # INTR_ROUTING, the periodic and watchdog timers and the mailbox. Without it
+  # the range is plain memory: the firmware's status polls never succeed and no
+  # interrupt can ever be raised.
+  io:
+    base_addr: 0x0
+    size: 0x40000
+    permissions: rw
+    space: io
+    emulate: halucinator.peripheral_models.falcon_engine.FalconEngine
 
 intercepts: []
