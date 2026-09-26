@@ -13,6 +13,7 @@ DMA, TLB, SIZED = 0x18, 0x1C, 0x20
 CARRY, ROTC = 0x24, 0x28
 MULTI, TRAPW, SIGNED = 0x2C, 0x30, 0x34
 MISC, MISC2, LASTTHREE = 0x38, 0x3C, 0x40
+VEC1 = 0x44
 
 # The code page the harness places in external port 0, and where.
 CODE_PAGE_EXT_OFF = 0x2200
@@ -162,6 +163,11 @@ def _lastthree():
     return (ins | (iords << 16)) & M32
 
 
+def _vec1():
+    """The vector-1 handler's marker. Zero would mean it never ran."""
+    return 0xB1
+
+
 def expected():
     """Every word the firmware must leave in DMEM."""
     sum_sq, mix, alu = _sum_sq(), _mix(), _alu()
@@ -179,6 +185,7 @@ def expected():
     misc = _misc()
     misc2 = _misc2()
     lastthree = _lastthree()
+    vec1 = _vec1()
     return {
         "irq_count": N_IRQ,
         "mix": mix,
@@ -196,8 +203,10 @@ def expected():
         "misc": misc,
         "misc2": misc2,
         "lastthree": lastthree,
+        "vec1": vec1,
         "done": (mix ^ sum_sq ^ alu ^ regs ^ dma ^ tlb ^ sized ^ carry
-                 ^ rotc ^ multi ^ trapw ^ signed ^ misc ^ misc2 ^ lastthree),
+                 ^ rotc ^ multi ^ trapw ^ signed ^ misc ^ misc2 ^ lastthree
+                 ^ vec1),
     }
 
 
@@ -206,7 +215,7 @@ OFFSETS = {"irq_count": IRQ_COUNT, "mix": MIX, "sum_sq": SUM_SQ,
            "sized": SIZED, "carry": CARRY, "rotc": ROTC,
            "multi": MULTI, "trapw": TRAPW,
            "signed": SIGNED, "misc": MISC, "misc2": MISC2,
-           "lastthree": LASTTHREE}
+           "lastthree": LASTTHREE, "vec1": VEC1}
 
 if __name__ == "__main__":
     for k, v in expected().items():

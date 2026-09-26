@@ -209,3 +209,39 @@ def test_a_line_routed_to_the_host_reaches_neither_vector(eng):
     assert eng.pending_and_enabled() == 1 << 3   # pending, as hardware would
     assert eng.pending_and_enabled(vector=0) == 0
     assert eng.pending_and_enabled(vector=1) == 0
+
+
+# -- the write-sweep contract ----------------------------------------------
+#
+# GhidraBackend cannot intercept MMIO on the Ghidra backend, so it shadows the
+# registers a peripheral declares live and reports one as written when its
+# value changes. That makes a register with an action attached depend on an
+# invariant: it must not read back what was written to it. If it did, writing
+# the same value twice would look like no change at all and the second write
+# would never reach the peripheral -- which for INTR_SET or INTR_CLEAR means a
+# silently dropped interrupt or a silently dropped acknowledgement.
+
+ACTION_REGISTERS = {INTR_SET, INTR_CLEAR, INTR_EN_SET, INTR_EN_CLEAR,
+                    MAILBOX_REQ}
+
+
+def test_no_action_register_reads_back_what_was_written(eng):
+    probe = 0x5A5A5A5A
+    for off in eng.live_registers():
+        if off not in ACTION_REGISTERS:
+            continue
+        eng.hw_write(off, 4, probe)
+        assert eng.hw_read(off, 4) != probe, (
+            f"register 0x{off:05x} echoes its written value; the backend's "
+            f"write sweep would drop a repeated write to it")
+
+
+def test_a_repeated_identical_write_still_acts(eng):
+    """Set, acknowledge, set the same line again -- all with the same value."""
+    eng.hw_write(INTR_MODE, 4, 0x0000)          # edge-triggered, so settable
+    eng.hw_write(INTR_SET, 4, 0x0001)
+    assert eng.hw_read(INTR, 4) & 1
+    eng.hw_write(INTR_CLEAR, 4, 0x0001)
+    assert not eng.hw_read(INTR, 4) & 1
+    eng.hw_write(INTR_SET, 4, 0x0001)           # identical to the first write
+    assert eng.hw_read(INTR, 4) & 1

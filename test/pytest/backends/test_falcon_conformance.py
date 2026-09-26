@@ -392,3 +392,15 @@ def test_ins_and_the_synchronous_io_pair(run):
     """
     _, _, got = run
     assert got["lastthree"] == oracle._lastthree()
+
+
+def test_a_line_routed_to_vector_one_enters_iv1(run):
+    """Routing decides which vector a line enters, and it was ignored.
+
+    Verified by control: with the routing write replaced by zero the line goes
+    to vector 0, whose enable is clear by this point, so it is dropped and the
+    marker stays 0. irq_count is *not* the discriminator -- a misrouted line is
+    refused rather than counted -- so this asserts the marker.
+    """
+    _, _, got = run
+    assert got["vec1"] == oracle._vec1()

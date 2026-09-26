@@ -60,6 +60,8 @@
         st b32 D[$r1] $r0
         mov $r1 0x40
         st b32 D[$r1] $r0
+        mov $r1 0x44
+        st b32 D[$r1] $r0
 
 // -- install the handler ---------------------------------------------------
         mov $r1 #handler
@@ -413,6 +415,39 @@ afterfar:
         mov $r2 0x40
         st b32 D[$r2] $r1
 
+// -- interrupt routing to vector 1 -----------------------------------------
+// INTR_ROUTING gives each line two bits; 2 means falcon vector 1. This routes
+// line 1 there, installs $iv1, enables ie1 and raises the line.
+//
+// With routing ignored -- as it was until it was modelled -- the line goes to
+// vector 0, whose enable this firmware cleared after the wait loop, so
+// delivery is refused and the handler below simply never runs. Measured: the
+// marker stays 0 and irq_count is unchanged at 8. So the marker is the whole
+// discriminator here; irq_count is not, because a misrouted line would be
+// dropped rather than counted.
+        mov $r1 #v1handler
+        mov $iv1 $r1
+        clear b32 $r2
+        mov $r3 0x300
+        iowr I[$r3] $r2                 // INTR_MODE: all lines edge-triggered
+        mov $r2 0x20000                 // line 1 -> route 2 -> vector 1
+        mov $r3 0x700
+        iowr I[$r3] $r2                 // INTR_ROUTING
+        mov $r2 0x2
+        mov $r3 0x400
+        iowr I[$r3] $r2                 // INTR_EN_SET line 1
+        clear b32 $r6
+        bset $flags ie1
+        mov $r2 0x2
+        clear b32 $r3
+        iowr I[$r3] $r2                 // INTR_SET line 1
+        clear b32 $r4                   // give delivery a step to land
+        clear b32 $r4
+        clear b32 $r4
+        bclr $flags ie1
+        mov $r1 0x44
+        st b32 D[$r1] $r6
+
 // -- fold everything into the final answer --------------------------------
 // Load every term from memory. An earlier version carried sum_sq in $r7
 // across the DMA and TLB sections, which both use $r7 -- so the fold silently
@@ -461,9 +496,20 @@ afterfar:
         mov $r1 0x40
         ld b32 $r4 D[$r1]
         xor $r3 $r3 $r4
+        mov $r1 0x44
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
         mov $r1 0xc
         st b32 D[$r1] $r3
         exit
+
+// -- the vector-1 handler --------------------------------------------------
+v1handler:
+        mov $r6 0xb1
+        mov $r1 0x2
+        mov $r2 0x100
+        iowr I[$r2] $r1                 // INTR_CLEAR line 1
+        iret
 
 // -- a callee that returns through mpopaddret ------------------------------
 // The caller allocates two argument words before the call; mpopaddret pops
