@@ -338,11 +338,7 @@ def test_signed_and_unsigned_compare_differ(run):
 #
 # crypt is excluded: it is deliberately unmodelled (crypt.rst is "todo: write
 # me" throughout), so executing it would prove nothing.
-KNOWN_UNEXECUTED = {
-    "ins",      # bitfield insert; envyas rejects every operand form tried
-    "iords",    # I/O read with shift
-    "iowrs",    # I/O write with shift
-}
+KNOWN_UNEXECUTED: set = set()
 
 
 def test_no_new_instruction_goes_unexecuted():
@@ -385,3 +381,14 @@ def test_no_new_instruction_goes_unexecuted():
         f"{len(unexecuted)} instruction(s) implemented but executed by no "
         f"test firmware: {sorted(unexecuted)}. Add them to the conformance "
         f"firmware, or to KNOWN_UNEXECUTED with a reason.")
+
+
+def test_ins_and_the_synchronous_io_pair(run):
+    """ins replaces a bitfield in place; iowrs/iords are the synchronous forms.
+
+    These were the last three instructions with nothing executing them. `ins`
+    needed envydis's own bitfield notation -- `0x4:0x7`, a position and a top
+    bit, not a position and a width.
+    """
+    _, _, got = run
+    assert got["lastthree"] == oracle._lastthree()

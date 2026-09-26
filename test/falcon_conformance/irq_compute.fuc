@@ -58,6 +58,8 @@
         st b32 D[$r1] $r0
         mov $r1 0x3c
         st b32 D[$r1] $r0
+        mov $r1 0x40
+        st b32 D[$r1] $r0
 
 // -- install the handler ---------------------------------------------------
         mov $r1 #handler
@@ -312,6 +314,11 @@ sumloop:
         mov $tv $r1
         clear b32 $r6
         trap 0x1
+        mov $r7 $flags
+        shr b32 $r7 $r7 0x18
+        and $r7 $r7 $r2                 // ta after the handler cleared it: 0
+        or $r6 $r6 $r7
+        trap 0x2                        // a second trap must be deliverable
         mov $r1 0x30
         st b32 D[$r1] $r6
 
@@ -389,6 +396,23 @@ sumloop:
         lbra #afterfar
 afterfar:
 
+// -- the last three ---------------------------------------------------------
+// io.rst: iowrs and iords are the *synchronous* forms -- the write completes
+// before the instruction retires rather than being posted. Transfers in this
+// model are synchronous anyway, so they behave as iowr/iord do, and saying so
+// is the point of running them.
+        mov $r1 0xabcd
+        mov $r2 0xf
+        ins $r1 $r2 0x4:0x7             // bits 4-7 := 0xf  -> 0xabfd
+        mov $r3 0x800
+        mov $r4 0x5a5a
+        iowrs I[$r3] $r4
+        iords $r5 I[$r3]                // -> 0x5a5a
+        shl b32 $r5 $r5 0x10
+        or $r1 $r1 $r5
+        mov $r2 0x40
+        st b32 D[$r2] $r1
+
 // -- fold everything into the final answer --------------------------------
 // Load every term from memory. An earlier version carried sum_sq in $r7
 // across the DMA and TLB sections, which both use $r7 -- so the fold silently
@@ -434,6 +458,9 @@ afterfar:
         mov $r1 0x3c
         ld b32 $r4 D[$r1]
         xor $r3 $r3 $r4
+        mov $r1 0x40
+        ld b32 $r4 D[$r1]
+        xor $r3 $r3 $r4
         mov $r1 0xc
         st b32 D[$r1] $r3
         exit
@@ -463,6 +490,10 @@ traphandler:
         pop $r8
         add b32 $r8 $r8 0x2
         push $r8
+// Nothing clears ta -- not iret. A handler that does not clear it makes the
+// next trap a double trap, which stops the core. Clearing it here is what
+// lets the caller take a second trap, and that second trap is the test.
+        bclr $flags ta
         iret
 
 // -- saves r0-r3 via mpush, destroys them, restores them on the way out ----

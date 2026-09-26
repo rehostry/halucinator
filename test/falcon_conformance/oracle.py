@@ -12,7 +12,7 @@ IRQ_COUNT, MIX, SUM_SQ, DONE, ALU, REGS = 0x00, 0x04, 0x08, 0x0C, 0x10, 0x14
 DMA, TLB, SIZED = 0x18, 0x1C, 0x20
 CARRY, ROTC = 0x24, 0x28
 MULTI, TRAPW, SIGNED = 0x2C, 0x30, 0x34
-MISC, MISC2 = 0x38, 0x3C
+MISC, MISC2, LASTTHREE = 0x38, 0x3C, 0x40
 
 # The code page the harness places in external port 0, and where.
 CODE_PAGE_EXT_OFF = 0x2200
@@ -118,8 +118,15 @@ def _multi():
 
 
 def _trapw():
-    """The handler records `0x100 | reason`; `trap 0x1` has reason 1."""
-    return (0x100 | 1) & M32
+    """Two traps, taken in turn, with ta cleared by the handler in between.
+
+    The handler records `0x100 | reason` each time, so the second call
+    overwrites the first: `trap 0x2` leaves reason 2. Between them the caller
+    ORs in the ta bit, which must read 0 because the handler cleared it -- and
+    if it did not, the second trap would be a double trap and stop the core
+    before this word was ever stored.
+    """
+    return (0x100 | 2) & M32
 
 
 def _signed():
@@ -148,6 +155,13 @@ def _misc2():
     return (iord | (r0 << 16) | (extrs_sign << 24)) & M32
 
 
+def _lastthree():
+    """ins replaces a bitfield in place; iords reads back what iowrs wrote."""
+    ins = (0xABCD & ~(0xF << 4)) | (0xF << 4)     # 0xabfd
+    iords = 0x5A5A
+    return (ins | (iords << 16)) & M32
+
+
 def expected():
     """Every word the firmware must leave in DMEM."""
     sum_sq, mix, alu = _sum_sq(), _mix(), _alu()
@@ -164,6 +178,7 @@ def expected():
     signed = _signed()
     misc = _misc()
     misc2 = _misc2()
+    lastthree = _lastthree()
     return {
         "irq_count": N_IRQ,
         "mix": mix,
@@ -180,8 +195,9 @@ def expected():
         "signed": signed,
         "misc": misc,
         "misc2": misc2,
+        "lastthree": lastthree,
         "done": (mix ^ sum_sq ^ alu ^ regs ^ dma ^ tlb ^ sized ^ carry
-                 ^ rotc ^ multi ^ trapw ^ signed ^ misc ^ misc2),
+                 ^ rotc ^ multi ^ trapw ^ signed ^ misc ^ misc2 ^ lastthree),
     }
 
 
@@ -189,7 +205,8 @@ OFFSETS = {"irq_count": IRQ_COUNT, "mix": MIX, "sum_sq": SUM_SQ,
            "done": DONE, "alu": ALU, "regs": REGS, "dma": DMA, "tlb": TLB,
            "sized": SIZED, "carry": CARRY, "rotc": ROTC,
            "multi": MULTI, "trapw": TRAPW,
-           "signed": SIGNED, "misc": MISC, "misc2": MISC2}
+           "signed": SIGNED, "misc": MISC, "misc2": MISC2,
+           "lastthree": LASTTHREE}
 
 if __name__ == "__main__":
     for k, v in expected().items():
