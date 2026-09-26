@@ -202,6 +202,17 @@ def setup_memory(
     extra: Dict[str, Any] = {}
     if memory.alias_at is not None:
         extra["alias_at"] = int(memory.alias_at)
+    if getattr(memory, "space", None):
+        extra["space"] = memory.space
+        if not getattr(avatar, "supports_address_spaces", False):
+            # Silently flattening the space would put this region where the
+            # guest's loads and stores never look, and it would read zeros
+            # rather than fail.
+            log.error(
+                "Memory %r declares space %r but the %s backend does not model "
+                "address spaces; the region will be mapped into the default "
+                "space and the guest will not see it where it expects",
+                memory.name, memory.space, type(avatar).__name__)
     avatar.add_memory_range(
         memory.base_addr,
         memory.size,

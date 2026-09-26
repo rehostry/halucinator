@@ -112,6 +112,13 @@ class MemoryRegion:
 # ---------------------------------------------------------------------------
 
 class HalBackend(ABC):
+    # Whether this backend keeps a region's `space` separate. Harvard targets
+    # (Falcon, AVR, 8051) put code, data and I/O in different address spaces,
+    # and a backend that flattens them will read zeros where the guest expects
+    # data, with no error. Only the Ghidra backend models them today, so the
+    # capability is declared rather than assumed.
+    supports_address_spaces = False
+
     """
     Abstract base class for all HALucinator emulator backends.
 

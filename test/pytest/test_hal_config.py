@@ -243,3 +243,27 @@ class TestHalucinatorConfig:
         assert hc.watchpoints == []
         assert hc.symbols == []
         assert hc.callables == []
+
+
+def test_the_falcon_config_loads():
+    """test/falcon_fecs/falcon_fecs.yaml must parse, `space:` keys included.
+
+    It did not. The loader rejected the very key that config's own README tells
+    people to use, so the documented way to run Falcon raised a TypeError
+    before doing anything -- while the Python scripts used for verification
+    built MemoryRegion(space=...) directly and worked fine.
+    """
+    import pathlib
+
+    from halucinator.hal_config import HalucinatorConfig
+
+    cfg_path = (pathlib.Path(__file__).resolve().parents[1]
+                / "falcon_fecs" / "falcon_fecs.yaml")
+    if not cfg_path.is_file():
+        import pytest
+        pytest.skip(f"{cfg_path} missing")
+    cfg = HalucinatorConfig()
+    cfg.add_yaml(str(cfg_path))
+    assert cfg.machine.arch == "falcon"
+    spaces = {n: m.space for n, m in cfg.memories.items()}
+    assert spaces == {"imem": None, "dmem": "dmem", "io": "io"}, spaces

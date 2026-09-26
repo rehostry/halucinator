@@ -58,6 +58,8 @@ _LANGUAGE_MAP: Dict[str, str] = {
 
 
 class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
+    supports_address_spaces = True
+
     """
     In-process emulation backend via Ghidra's PCode EmulatorHelper.
     """

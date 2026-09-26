@@ -27,10 +27,17 @@ class HalMemConfig(object):
         irq: Optional[Any] = None,
         regions: Optional[Any] = None,
         alias_at: Optional[int] = None,
+        space: Optional[str] = None,
     ) -> None:
         '''
             Reads in config
         '''
+        # Sleigh address space for Harvard targets (Falcon, AVR, 8051), where
+        # code, data and I/O are separate spaces rather than one flat memory.
+        # Without this the Falcon config in test/falcon_fecs/ could not be
+        # loaded at all: the loader rejected the `space:` key its own README
+        # tells people to use.
+        self.space: Optional[str] = space
         self.name: str = name
         self.config_file: str = config_filename  # For reporting where problems are
         self.file: Optional[str] = file
