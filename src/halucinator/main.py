@@ -160,6 +160,48 @@ def get_qemu_target(
     return avatar, qemu
 
 
+def resolve_emulate(spec: Optional[str]) -> Any:
+    """Turn a config `emulate:` value into the peripheral class it names.
+
+    Shared by the avatar2 and Ghidra paths. The Ghidra path used to ignore
+    `emulate:` entirely, so a config that declared a peripheral got a plain
+    memory region and the peripheral was never attached.
+    """
+    if spec is None:
+        return None
+    if "." in spec:
+        import importlib
+        mod_path, _, cls_name = spec.rpartition(".")
+        return getattr(importlib.import_module(mod_path), cls_name)
+    from .peripheral_models import auto_model as _auto_model
+    found = (getattr(peripheral_emulators, spec, None)
+             or getattr(_auto_model, spec, None))
+    if found is None:
+        raise AttributeError("unknown emulate peripheral %r" % spec)
+    return found
+
+
+def memory_region_from_config(memory: Any) -> "MemoryRegion":
+    """Build a backend MemoryRegion from one parsed config entry.
+
+    Extracted because the Ghidra path used to build this inline and drop two
+    fields. `space` being dropped collapsed a Harvard target's three address
+    spaces into one, so dmem and io were then rejected as overlapping imem;
+    `emulate` being dropped meant a config that named a peripheral silently got
+    plain memory, and the firmware's status polls could never succeed.
+    """
+    from halucinator.backends.hal_backend import MemoryRegion
+    return MemoryRegion(
+        name=memory.name,
+        base_addr=memory.base_addr,
+        size=memory.size,
+        permissions=memory.permissions or "rwx",
+        file=memory.file,
+        space=getattr(memory, "space", None),
+        emulate=resolve_emulate(memory.emulate),
+    )
+
+
 def setup_memory(
     avatar: Avatar,
     memory: Any,
@@ -202,6 +244,17 @@ def setup_memory(
     extra: Dict[str, Any] = {}
     if memory.alias_at is not None:
         extra["alias_at"] = int(memory.alias_at)
+    if getattr(memory, "space", None):
+        extra["space"] = memory.space
+        if not getattr(avatar, "supports_address_spaces", False):
+            # Silently flattening the space would put this region where the
+            # guest's loads and stores never look, and it would read zeros
+            # rather than fail.
+            log.error(
+                "Memory %r declares space %r but the %s backend does not model "
+                "address spaces; the region will be mapped into the default "
+                "space and the guest will not see it where it expects",
+                memory.name, memory.space, type(avatar).__name__)
     avatar.add_memory_range(
         memory.base_addr,
         memory.size,
@@ -1605,15 +1658,11 @@ def _emulate_with_ghidra_backend(
 
     backend: "HalBackend" = GhidraBackend(arch=arch)
     for memory in config.memories.values():
-        region = MemoryRegion(
-            name=memory.name,
-            base_addr=memory.base_addr,
-            size=memory.size,
-            permissions=memory.permissions or "rwx",
-            file=memory.file,
-        )
-        log.info("Adding Memory: %s Addr: 0x%08x Size: 0x%08x",
-                 memory.name, memory.base_addr, memory.size)
+        region = memory_region_from_config(memory)
+        log.info("Adding Memory: %s Addr: 0x%08x Size: 0x%08x%s%s",
+                 memory.name, memory.base_addr, memory.size,
+                 f" space={region.space}" if region.space else "",
+                 f" emulate={memory.emulate}" if memory.emulate else "")
         backend.add_memory_region(region)
     backend.init()
 

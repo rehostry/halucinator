@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import is_dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from .hal_backend import (
@@ -49,10 +50,16 @@ _LANGUAGE_MAP: Dict[str, str] = {
     "powerpc:MPC8XX": "PowerPC:BE:32:MPC8270",
     "ppc64":          "PowerPC:BE:64:default",
     "x86":            "x86:LE:32:default",
+    # NVIDIA Falcon -- the microcontroller inside NVIDIA GPUs (PMU, SEC2,
+    # GSP, FECS/GPCCS).  Needs the ghidra-falcon processor module installed.
+    "falcon":         "Falcon:LE:32:fuc5",
+    "falcon-fuc4":    "Falcon:LE:32:fuc4",
 }
 
 
 class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
+    supports_address_spaces = True
+
     """
     In-process emulation backend via Ghidra's PCode EmulatorHelper.
     """
@@ -62,6 +69,7 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
         config: Any = None,
         arch: str = "cortex-m3",
         ghidra_install_dir: Optional[str] = None,
+        cpu_model: Optional[str] = None,
         **kwargs: Any,
     ):
         if not _HAVE_PYGHIDRA:
@@ -71,10 +79,20 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
             )
         self.config = config
         self.arch = arch
+        # A processor variant, where the arch has them (Falcon's fuc4/fuc5).
+        # Resolved against _LANGUAGE_MAP as "<arch>-<cpu_model>" in init().
+        # It used to be swallowed by **kwargs, so cpu_model="fuc4" silently
+        # loaded fuc5 and the first instruction that differs simply failed to
+        # decode.
+        self.cpu_model = cpu_model
         self.ghidra_install_dir = (
             ghidra_install_dir
             or os.environ.get("GHIDRA_INSTALL_DIR")
         )
+        # Set by a halting pcodeop (Falcon `exit`); step()/cont() honour it.
+        self._halted = False
+        self._halt_pc: Optional[int] = None
+        self._step_fault_pc: Optional[int] = None
         self._regions: List[MemoryRegion] = []
         self._breakpoints: Dict[int, int] = {}  # addr -> bp_id
         # Watchpoints: bp_id -> (addr, size, read, write)
@@ -125,6 +143,23 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
         from ghidra.app.emulator import EmulatorHelper
 
         lang_id_str = _LANGUAGE_MAP.get(self.arch)
+        if self.cpu_model:
+            variant = f"{self.arch}-{self.cpu_model}"
+            if variant in _LANGUAGE_MAP:
+                lang_id_str = _LANGUAGE_MAP[variant]
+                log.info("GhidraBackend: cpu_model=%r selects %s",
+                         self.cpu_model, lang_id_str)
+            elif lang_id_str and not lang_id_str.endswith(f":{self.cpu_model}"):
+                # Naming a variant that does not exist is a configuration
+                # error; saying nothing would run the default and look fine.
+                log.warning(
+                    "GhidraBackend: cpu_model=%r is not a known variant of "
+                    "arch=%r (have %s); using %s",
+                    self.cpu_model, self.arch,
+                    ", ".join(sorted(k.split("-", 1)[1]
+                                     for k in _LANGUAGE_MAP
+                                     if k.startswith(self.arch + "-"))) or "none",
+                    lang_id_str)
         if lang_id_str is None:
             raise ValueError(
                 f"GhidraBackend: no language mapping for arch={self.arch!r}"
@@ -152,7 +187,21 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
 
         from ghidra.program.model.mem import MemoryConflictException  # type: ignore
         for region in self._regions:
-            start = default_space.getAddress(region.base_addr)
+            space = default_space
+            if getattr(region, "space", None):
+                named = self._address_factory.getAddressSpace(region.space)
+                if named is None:
+                    log.warning(
+                        "GhidraBackend: region %s asks for address space %r, "
+                        "which %s does not define; falling back to the default "
+                        "space. Loads and stores the language directs at %r "
+                        "will NOT see this region.",
+                        region.name, region.space,
+                        self._language.getLanguageID(), region.space,
+                    )
+                else:
+                    space = named
+            start = space.getAddress(region.base_addr)
             try:
                 if region.file and os.path.isfile(region.file):
                     with open(region.file, "rb") as fh:
@@ -187,12 +236,21 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
             block.setExecute(True)
 
         self._emulator = EmulatorHelper(self._program)
+        self._install_mmio_peripherals()
 
         if self.arch in ("cortex-m3", "arm"):
             self._patch_arm_setISAMode()
             self._patch_arm_unimplemented_callothers()
         elif self.arch == "arm64":
             self._patch_arm_unimplemented_callothers()
+        elif self.arch in self._HALT_CALLOTHERS:
+            self._install_halt_callother(self._HALT_CALLOTHERS[self.arch])
+            if self.arch.startswith("falcon"):
+                self._install_falcon_xfer()
+                self._install_falcon_crypt(
+                    strict=bool(getattr(self, "strict_crypt", False)))
+        elif self.arch in self._CALLOTHER_STUBS:
+            self._patch_unimplemented_callothers(self._CALLOTHER_STUBS[self.arch])
 
     def shutdown(self) -> None:
         if self._emulator is not None:
@@ -212,9 +270,22 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
     # HalBackend primitives
     # ------------------------------------------------------------------
 
-    def _addr(self, addr: int):
-        default_space = self._address_factory.getDefaultAddressSpace()
-        return default_space.getAddress(addr)
+    def _addr(self, addr: int, space: Optional[str] = None):
+        """Build a Ghidra address, optionally in a named (non-default) space.
+
+        Harvard targets keep code, data and I/O in separate Sleigh spaces, so
+        an address is only meaningful together with the space it belongs to.
+        Callers that know which space they mean (an exception deliverer
+        pushing onto a data-space stack, say) pass it; everyone else gets the
+        language default and the previous behaviour.
+        """
+        if space:
+            named = self._address_factory.getAddressSpace(space)
+            if named is not None:
+                return named.getAddress(addr)
+            log.warning("GhidraBackend: no address space %r in %s; using the "
+                        "default space", space, self._language.getLanguageID())
+        return self._address_factory.getDefaultAddressSpace().getAddress(addr)
 
     # Ghidra register-name lookup fails for some cross-arch aliases
     # (e.g. "sp" on PowerPC where the stack pointer is r1). Normalize
@@ -230,6 +301,29 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
         "mips":           {"sp": "sp"},   # MIPS has "sp" directly
     }
 
+    # Bits that live inside a packed register rather than in one of their own.
+    # Falcon's $flags carries the ALU flags, the interrupt enables and the
+    # saved enables; the SLEIGH module defines them as bitranges of $flags so
+    # the guest's `bset $flags ie0` and the emulator's view are one piece of
+    # state. Ghidra's getRegister() does not resolve bitrange symbols, so the
+    # mapping has to be repeated here for callers that address them by name.
+    # Positions are envydis's flag-bit table (envydis/falcon.c tabfl).
+    _REGISTER_BITFIELDS: Dict[str, Dict[str, tuple]] = {
+        "falcon": {
+            "Cf": ("flags", 8),   "Of": ("flags", 9),
+            "Sf": ("flags", 10),  "Zf": ("flags", 11),
+            "Ie0": ("flags", 16), "Ie1": ("flags", 17),
+            "Ie2": ("flags", 18),
+            "Is0": ("flags", 20), "Is1": ("flags", 21),
+            "Is2": ("flags", 22),
+            "Ta": ("flags", 24),
+        },
+    }
+    _REGISTER_BITFIELDS["falcon-fuc4"] = _REGISTER_BITFIELDS["falcon"]
+
+    def _bitfield_of(self, name: str):
+        return self._REGISTER_BITFIELDS.get(self.arch, {}).get(name)
+
     def _resolve_register(self, name: str):
         """Ghidra-side register lookup with cross-arch name aliases."""
         alias = self._REGISTER_ALIASES.get(self.arch, {}).get(name)
@@ -241,9 +335,10 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
         return None
 
     def read_memory(self, addr: int, size: int, num_words: int = 1,
-                    raw: bool = False) -> Union[int, bytes]:
+                    raw: bool = False, space: Optional[str] = None
+                    ) -> Union[int, bytes]:
         total = size * num_words
-        data = bytes(self._emulator.readMemory(self._addr(addr), total))
+        data = bytes(self._emulator.readMemory(self._addr(addr, space), total))
         if raw or num_words > 1:
             return data
         endian = "big" if self._language.isBigEndian() else "little"
@@ -251,25 +346,40 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
 
     def write_memory(self, addr: int, size: int,
                      value: Union[int, bytes, bytearray],
-                     num_words: int = 1, raw: bool = False) -> bool:
+                     num_words: int = 1, raw: bool = False,
+                     space: Optional[str] = None) -> bool:
         if isinstance(value, (bytes, bytearray)):
             data = bytes(value)
         else:
             endian = "big" if self._language.isBigEndian() else "little"
             data = value.to_bytes(size * num_words, endian)
         try:
-            self._emulator.writeMemory(self._addr(addr), data)
+            self._emulator.writeMemory(self._addr(addr, space), data)
             return True
         except Exception:  # noqa: BLE001
             return False
 
     def read_register(self, register: str) -> int:
+        field = self._bitfield_of(register)
+        if field is not None:
+            container, bit = field
+            return (self.read_register(container) >> bit) & 1
         reg = self._resolve_register(register)
         if reg is None:
             raise ValueError(f"Unknown register: {register!r}")
         return int(self._emulator.readRegister(reg).longValue())
 
     def write_register(self, register: str, value: int) -> None:
+        field = self._bitfield_of(register)
+        if field is not None:
+            container, bit = field
+            packed = self.read_register(container)
+            if int(value) & 1:
+                packed |= (1 << bit)
+            else:
+                packed &= ~(1 << bit)
+            self.write_register(container, packed & 0xFFFFFFFF)
+            return
         reg = self._resolve_register(register)
         if reg is None:
             raise ValueError(f"Unknown register: {register!r}")
@@ -379,6 +489,8 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
             while self._pending_irqs:
                 self._apply_pending_irq(self._pending_irqs.pop(0))
             for _ in range(self._STEP_BATCH):
+                if self._halted:
+                    return
                 if not self._emulator.step(TaskMonitor.DUMMY):
                     # If the firmware just ran `bx lr` with LR holding
                     # an EXC_RETURN magic, Ghidra raises a decode
@@ -458,7 +570,35 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
         if self._emulator is None:
             raise RuntimeError("Call GhidraBackend.init() first")
         from ghidra.util.task import TaskMonitor  # type: ignore
-        self._emulator.step(TaskMonitor.DUMMY)
+        if self._halted:
+            return
+        # A failed step leaves PC where it was. Callers that step in a loop
+        # would otherwise spin on the same faulting instruction for the whole
+        # budget and report a plausible-looking "did not finish" -- which is
+        # how an unimplemented pcodeop reads as a slow firmware. Say so once,
+        # with the address, and record it for the caller to test.
+        if not self._emulator.step(TaskMonitor.DUMMY):
+            exec_addr = self._emulator.getExecutionAddress()
+            pc = (int(exec_addr.getUnsignedOffset())
+                  if exec_addr is not None else 0)
+            if not self._maybe_handle_exc_return(pc):
+                if getattr(self, "_step_fault_pc", None) != pc:
+                    self._step_fault_pc = pc
+                    log.error(
+                        "GhidraBackend.step(): stuck at pc=0x%x state=%s err=%r",
+                        pc, str(self._emulator.getEmulateExecutionState()),
+                        str(self._emulator.getLastError() or ""))
+            else:
+                try:
+                    self._emulator.setHalt(False)
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            self._step_fault_pc = None
+        if getattr(self, "_mmio", None):
+            self._sweep_mmio_writes()
+            self._tick_peripherals()
+            self._deliver_peripheral_irq()
 
     # ARM-v7M exception-return magic values. When an ISR does `bx lr` with
     # LR = one of these, the hardware normally pops the exception frame.
@@ -713,6 +853,204 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
     # ARM-specific: work around a Ghidra EmulatorHelper bug
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Emulated MMIO
+    # ------------------------------------------------------------------
+
+    def _install_mmio_peripherals(self) -> None:
+        """Route reads and writes in `emulate:` regions to their peripheral.
+
+        Ghidra's emulator offers no general memory-access callback we can
+        implement from Python -- ``MemoryAccessFilter`` is an abstract class,
+        not an interface -- so reads are caught through the memory fault
+        handler instead: an emulated region is left *uninitialized*, every read
+        of it faults, and the handler answers from the peripheral. Writes have
+        no fault to hook, so they are swept out of the emulator's tracked
+        write set after each step.
+
+        The consequence worth knowing: a peripheral sees each write at the end
+        of the step that made it, not at the instant of the store. For status
+        and mailbox registers that is indistinguishable; for a device that must
+        act *during* an instruction it is not, and that device needs a real
+        callback rather than this.
+        """
+        self._mmio: List[tuple] = []          # (start, end, peripheral)
+        for region in self._regions:
+            per = getattr(region, "emulate", None)
+            if per is None:
+                continue
+            inst = per(region.name, region.base_addr, region.size) if isinstance(per, type) else per
+            # The peripheral must be addressed in its region's space, or a
+            # Harvard target will exchange values with the wrong memory.
+            if getattr(region, "space", None) and not getattr(inst, "space", None):
+                inst.space = region.space
+            self._mmio.append((region.base_addr, region.base_addr + region.size, inst))
+            log.info("GhidraBackend: %s emulated by %s",
+                     region.name, type(inst).__name__)
+        if not self._mmio:
+            return
+        # A peripheral that names its live registers gets them shadowed each
+        # step; one that does not is served by the fault handler alone, which
+        # answers each address once.
+        self._mmio_live = []
+        for start, end, inst in self._mmio:
+            live = getattr(inst, "live_registers", None)
+            if callable(live):
+                live = list(live())
+            if live:
+                self._mmio_live.append((start, inst, list(live), {}))
+                log.info("GhidraBackend: shadowing %d live registers for %s",
+                         len(live), type(inst).__name__)
+        self._install_mmio_fault_handler()
+
+    @staticmethod
+    def _space_of(per) -> Optional[str]:
+        return getattr(per, "space", None)
+
+    def _peripheral_for(self, addr: int):
+        for start, end, inst in getattr(self, "_mmio", ()):
+            if start <= addr < end:
+                return start, inst
+        return None, None
+
+    def _install_mmio_fault_handler(self) -> None:
+        import jpype  # type: ignore
+        from ghidra.pcode.memstate import MemoryFaultHandler  # type: ignore
+        backend = self
+
+        @jpype.JImplements(MemoryFaultHandler)
+        class _MmioFaults:
+            @jpype.JOverride
+            def uninitializedRead(self, address, size, buf, bufOffset):
+                addr = int(address.getOffset())
+                base, per = backend._peripheral_for(addr)
+                if per is None:
+                    return False
+                try:
+                    value = per.hw_read(addr - base, size)
+                except Exception:            # a model bug must not read as a CPU fault
+                    log.exception("GhidraBackend: %s hw_read(0x%x) raised",
+                                  type(per).__name__, addr - base)
+                    return False
+                endian = "big" if backend._language.isBigEndian() else "little"
+                data = int(value & ((1 << (8 * size)) - 1)).to_bytes(size, endian)
+                for i, b in enumerate(data):
+                    buf[bufOffset + i] = jpype.JByte(b - 256 if b > 127 else b)
+                return True
+
+            @jpype.JOverride
+            def unknownAddress(self, address, write):
+                return False
+
+        self._mmio_faults = _MmioFaults()     # keep a reference alive
+        self._emulator.setMemoryFaultHandler(self._mmio_faults)
+
+    def _sweep_mmio_writes(self) -> None:
+        """Exchange values with each emulated peripheral once per step.
+
+        Ghidra's emulator gives us no usable general MMIO callback from
+        Python. ``MemoryAccessFilter`` is an abstract class, not an interface,
+        so JPype cannot implement it and a Java shim cannot see Ghidra's
+        classes from the system classpath. ``MemoryFaultHandler`` fires only
+        for *uninitialized* reads, so it answers each address exactly once and
+        then the value is cached forever -- useless for a status register that
+        has to change. ``getTrackedMemoryWriteSet()`` returns null here.
+
+        So instead of intercepting accesses, we shadow a bounded set of
+        registers the peripheral declares live: after each step, any that
+        changed are reported as writes, and all of them are refreshed from the
+        peripheral. Reads therefore see values that are one step stale, and a
+        register the peripheral does not declare is ordinary memory.
+        """
+        for base, per, live, shadow in getattr(self, "_mmio_live", ()):
+            for off in live:
+                addr = base + off
+                try:
+                    cur = self.read_memory(addr, 4, 1, space=self._space_of(per))
+                except Exception:
+                    continue
+                if shadow.get(off) is not None and cur != shadow[off]:
+                    try:
+                        per.hw_write(off, 4, cur)
+                    except Exception:
+                        log.exception("GhidraBackend: %s hw_write(0x%x) raised",
+                                      type(per).__name__, off)
+                try:
+                    fresh = per.hw_read(off, 4) & 0xFFFFFFFF
+                except Exception:
+                    log.exception("GhidraBackend: %s hw_read(0x%x) raised",
+                                  type(per).__name__, off)
+                    continue
+                if fresh != cur:
+                    self.write_memory(addr, 4, fresh, space=self._space_of(per))
+                shadow[off] = fresh
+
+    def _tick_peripherals(self, steps: int = 1) -> None:
+        """Advance any peripheral that models time.
+
+        A peripheral with a `tick` gets one call per emulated instruction. The
+        unit mismatch is the peripheral's to resolve -- hardware timers count
+        clock cycles and this counts instructions.
+        """
+        for _base, per, _live, _shadow in getattr(self, "_mmio_live", ()):
+            tick = getattr(per, "tick", None)
+            if callable(tick):
+                try:
+                    tick(steps)
+                except Exception:
+                    log.exception("GhidraBackend: %s tick() raised",
+                                  type(per).__name__)
+
+    def _deliver_peripheral_irq(self) -> bool:
+        """Take an interrupt a peripheral has raised, if the CPU will have it.
+
+        Opt-in (`auto_deliver_peripheral_irqs`), because a backend whose
+        dispatch loop already owns IRQ delivery should not have entries
+        synthesised underneath it.
+
+        No acknowledgement is issued here, and that is deliberate rather than
+        an omission: the architecture gates re-entry itself. Delivery requires
+        the enable bit, entry clears it, and only the handler's return restores
+        it -- so a line that stays pending cannot re-enter until the firmware
+        is ready for it. Acking on the firmware's behalf would hide a handler
+        that never does.
+        """
+        if not getattr(self, "auto_deliver_peripheral_irqs", False):
+            return False
+        deliverer = getattr(self, "_peripheral_deliverer", None)
+        if deliverer is None:
+            from .irq.delivery import build_exception_deliverer
+            deliverer = build_exception_deliverer(self.arch)
+            self._peripheral_deliverer = deliverer
+            if deliverer is None:
+                log.warning("GhidraBackend: no exception deliverer for %s; "
+                            "peripheral IRQs cannot be taken", self.arch)
+                self.auto_deliver_peripheral_irqs = False
+                return False
+        from .irq.delivery import DeliveryPlan
+        base_plan = getattr(self, "peripheral_irq_plan", None) or DeliveryPlan()
+        for _base, per, _live, _shadow in getattr(self, "_mmio_live", ()):
+            pending = getattr(per, "pending_and_enabled", None)
+            if not callable(pending):
+                continue
+            # Ask per vector where the peripheral models interrupt routing, so
+            # a line the firmware routed to vector 1 is delivered there and a
+            # line routed to the host is not delivered here at all. Peripherals
+            # without routing answer once, as before.
+            try:
+                per_vector = [(v, pending(vector=v)) for v in (0, 1)]
+            except TypeError:
+                per_vector = [(base_plan.falcon_vector, pending())]
+            for vector, bits in per_vector:
+                if not bits:
+                    continue
+                num = (bits & -bits).bit_length() - 1   # lowest-numbered line
+                plan = replace(base_plan, falcon_vector=vector) \
+                    if is_dataclass(base_plan) else base_plan
+                if deliverer.deliver(self, num, plan):
+                    return True
+        return False
+
     def _patch_arm_setISAMode(self) -> None:
         """Replace ARM's built-in setISAMode pcode-op handler with a no-op.
 
@@ -768,6 +1106,221 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
                     return
         except Exception as e:   # noqa: BLE001
             log.warning("GhidraBackend: setISAMode patch failed: %s", e)
+
+    # CALLOTHER pcodeops to stub per architecture, beyond the ARM set below.
+    # A stub returns 0 into the output varnode (if any) instead of faulting.
+    # Pcodeops that stop the core rather than completing. `exit` on Falcon
+    # halts; the processor module's own default completes, because Ghidra's
+    # Emulate cannot stop from inside a behaviour, so the backend supplies it.
+    _HALT_CALLOTHERS: Dict[str, set] = {
+        "falcon":      {"FalconHalt"},
+        "falcon-fuc4": {"FalconHalt"},
+    }
+
+    _CALLOTHER_STUBS: Dict[str, set] = {
+        # Falcon needs no stub table. Its processor module declares an
+        # instruction state modifier which carries defaults for the ops that
+        # are device behaviour rather than CPU semantics (DMA, crypt, TLB), and
+        # everything else is modelled in SLEIGH. The table that used to be here
+        # never ran at all: without a state modifier Ghidra has no pcodeOpMap,
+        # so _install_callother_stubs returned at its `state_mod is None` guard
+        # and the names were never installed. Two of them -- FalconSext and
+        # FalconXfer -- had also stopped existing.
+        # MIPS: setISAMode toggles MIPS16/microMIPS; firmware that never uses
+        # those modes only needs it not to fault.
+        "mips":        {"setISAMode"},
+        "mipsel":      {"setISAMode"},
+    }
+
+    def _install_falcon_crypt(self, strict: bool = False) -> None:
+        """Make Falcon's crypt coprocessor loud rather than quietly wrong.
+
+        It is not modelled, and deliberately so: envytools' crypt.rst is
+        "todo: write me" from top to bottom, and the RNN database gives the op
+        *names* only -- several of them literally UNK -- with no operand or
+        register conventions. There is nothing to implement it from, and a
+        guessed AES would produce confident wrong answers, which is worse than
+        no answer for the thing crypto is usually there to decide.
+
+        So every crypt op is recorded and reported instead of returning zero.
+        A rehost that touches signed-microcode paths (SEC2, GSP, PMU) can then
+        see that it did, rather than believing a signature check it never ran.
+        `strict` halts the core on the first one.
+
+        Neither shipped GP102 image -- FECS or GPCCS -- executes a single crypt
+        instruction, so this changes nothing for them.
+        """
+        import jpype  # type: ignore
+        from ghidra.pcode.emulate.callother import OpBehaviorOther  # type: ignore
+
+        backend = self
+        self.falcon_crypt_ops_seen: set = set()
+
+        @jpype.JImplements(OpBehaviorOther)
+        class _Crypt:
+            @jpype.JOverride
+            def evaluate(self, emu, out, inputs):
+                op = None
+                try:
+                    vals = list(inputs)
+                    if vals:
+                        op = int(emu.getMemoryState().getValue(vals[0]))
+                except Exception:  # noqa: BLE001
+                    pass
+                if op not in backend.falcon_crypt_ops_seen:
+                    backend.falcon_crypt_ops_seen.add(op)
+                    log.error(
+                        "Falcon crypt op %s executed and is NOT modelled "
+                        "(undocumented upstream); any result depending on it "
+                        "is not trustworthy", hex(op) if op is not None else "?")
+                if out is not None:
+                    emu.getMemoryState().setValue(out, 0)
+                if strict:
+                    backend._halted = True
+
+        for name in ("FalconCryptImm", "FalconCrypt"):
+            self._install_callother_stubs({name}, (), label=f"falcon:{name}",
+                                          behavior=_Crypt())
+
+    def _install_falcon_xfer(self, engine=None) -> None:
+        """Wire Falcon's DMA and TLB instructions to a real model.
+
+        These are the ops the processor module deliberately leaves inert: they
+        are device behaviour, and what they do depends on what the engine is
+        wired to. Attaching a FalconXferEngine here makes them real.
+
+        Operand order is taken from shipped firmware, not from the prose.
+        xfer.rst lists "Operands: SRC1, SRC2" against "Form: R2, R1", which
+        reads as SRC1=R2; GP102 FECS settles it the other way:
+
+            shl b32 $r12 $r6 0x10      ; size into bits 16+
+            or  $r9 $r4 $r12           ; local | size<<16
+            xdld $r5 $r9
+
+        so the *second* operand carries local_address|size<<16 -- it is SRC2 --
+        and the first is the external offset.
+        """
+        from halucinator.peripheral_models.falcon_xfer import FalconXferEngine
+        import jpype  # type: ignore
+        from ghidra.pcode.emulate.callother import OpBehaviorOther  # type: ignore
+
+        if engine is None:
+            engine = getattr(self, "falcon_xfer", None) or FalconXferEngine()
+        self.falcon_xfer = engine
+        self.falcon_xfer_errors: List[str] = []
+        backend = self
+
+        def _val(emu, vn):
+            return int(emu.getMemoryState().getValue(vn)) & 0xFFFFFFFF
+
+        def behavior(fn, writes_result=False):
+            @jpype.JImplements(OpBehaviorOther)
+            class _B:
+                @jpype.JOverride
+                def evaluate(self, emu, out, inputs):
+                    try:
+                        # Ghidra hands OpBehaviorOther the operands directly;
+                        # the userop index is not among them.
+                        args = [_val(emu, v) for v in list(inputs)]
+                        res = fn(*args)
+                    except Exception as exc:  # noqa: BLE001
+                        # Logging alone still hands the guest a zero and lets
+                        # it carry on. Record it so a run can be rejected.
+                        log.exception("Falcon xfer/TLB op failed")
+                        backend.falcon_xfer_errors.append(repr(exc))
+                        res = 0
+                    if writes_result and out is not None:
+                        emu.getMemoryState().setValue(out, int(res or 0))
+            return _B()
+
+        def targets():
+            return backend.read_register("xtargets")
+
+        def xdld(src1, src2):
+            return engine.data_load(backend, (targets() >> 8) & 7,
+                                    backend.read_register("xdbase"),
+                                    src1, src2 & 0xFFFF, (src2 >> 16) & 7)
+
+        def xdst(src1, src2):
+            return engine.data_store(backend, (targets() >> 12) & 7,
+                                     backend.read_register("xdbase"),
+                                     src1, src2 & 0xFFFF, (src2 >> 16) & 7)
+
+        try:
+            self.read_register("cauth")
+            self._has_cauth = True
+        except Exception:  # noqa: BLE001
+            # No $cauth on this variant, so no secret-code-load flag exists to
+            # read. Say it once here rather than silently answering "not
+            # secret" on every code load: a page loaded as non-secret gets
+            # different TLB flags and becomes clearable by ITLB.
+            self._has_cauth = False
+            log.info("GhidraBackend: no $cauth on %s; code loads are treated "
+                     "as non-secret", self.arch)
+
+        def xcld(src1, src2):
+            # xfer.rst: the secret flag comes from $cauth bit 16.
+            secret = (bool((backend.read_register("cauth") >> 16) & 1)
+                      if backend._has_cauth else False)
+            return engine.code_load(backend, targets() & 7,
+                                    backend.read_register("xcbase"),
+                                    src1, src2 & 0xFFFF, secret)
+
+        ops = {
+            "FalconXdLd":  (xdld, False),
+            "FalconXdSt":  (xdst, False),
+            "FalconXcLd":  (xcld, False),
+            "FalconPtlb":  (engine.ptlb, True),
+            "FalconVtlb":  (engine.vtlb, True),
+            "FalconItlb":  (lambda p: engine.itlb(p), False),
+            # Transfers complete inside the instruction, so by the time a wait
+            # runs the queue is genuinely empty. These are no-ops because the
+            # model makes them true, not because they are being skipped.
+            "FalconXdWait":  (lambda: None, False),
+            "FalconXcWait":  (lambda: None, False),
+            "FalconXdFence": (lambda: None, False),
+        }
+        for name, (fn, writes) in ops.items():
+            self._install_callother_stubs({name}, (), label=f"falcon:{name}",
+                                          behavior=behavior(fn, writes))
+        log.info("GhidraBackend: Falcon DMA + TLB modelled (%d ports declared)",
+                 len(engine.ports))
+
+    def _install_halt_callother(self, names) -> None:
+        """Make the named pcodeops halt the backend instead of completing.
+
+        `exit` on Falcon stops the core. Ghidra's Emulate exposes no way to
+        stop from inside an OpBehaviorOther, so the behaviour installed here
+        records it on the backend and step()/cont() act on the flag.
+        """
+        import jpype  # type: ignore
+        from ghidra.pcode.emulate.callother import OpBehaviorOther  # type: ignore
+
+        backend = self
+
+        @jpype.JImplements(OpBehaviorOther)
+        class _Halting:
+            @jpype.JOverride
+            def evaluate(self, emu, out, inputs):
+                # Record where it stopped. Falcon's `exit` is a flow
+                # terminator, so by the time a caller reads pc it is 0 and the
+                # useful address is gone; take it from the emulator now.
+                try:
+                    addr = emu.getExecuteAddress()
+                    backend._halt_pc = int(addr.getUnsignedOffset())
+                except Exception:  # noqa: BLE001
+                    backend._halt_pc = None
+                backend._halted = True
+                log.info("GhidraBackend: core halted at pc=%s",
+                         hex(backend._halt_pc) if backend._halt_pc is not None
+                         else "unknown")
+
+        self._install_callother_stubs(names, (), label=f"{self.arch}-halt",
+                                      behavior=_Halting())
+
+    def _patch_unimplemented_callothers(self, names: set) -> None:
+        """Install zero-returning stubs for the named CALLOTHER pcodeops."""
+        self._install_callother_stubs(names, (), label=self.arch)
 
     def _patch_arm_unimplemented_callothers(self) -> None:
         """Install no-op stubs for ARM CALLOTHER pcode-ops that Sleigh
@@ -839,6 +1392,31 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
                 except Exception:  # noqa: BLE001
                     pass
 
+        self._install_callother_stubs(
+            explicit_targets, prefix_targets, label="ARM")
+
+    def _install_callother_stubs(self, explicit_targets, prefix_targets=(),
+                                 label: str = "", behavior=None) -> None:
+        """Reflectively install zero-returning handlers for CALLOTHER pcodeops.
+
+        Ghidra resolves a userop by index through the instruction state
+        modifier's pcodeOpMap, so overriding entries there makes the named ops
+        no-ops instead of faults. Shared by every architecture; only the name
+        set differs.
+        """
+        import jpype  # type: ignore  # noqa: F401
+        from ghidra.pcode.emulate.callother import OpBehaviorOther  # type: ignore
+        from java.lang import Integer as _JInteger  # type: ignore
+
+        @jpype.JImplements(OpBehaviorOther)
+        class _ZeroReturning:
+            @jpype.JOverride
+            def evaluate(self, emu, out, inputs):
+                if out is not None:
+                    try:
+                        emu.getMemoryState().setValue(out, 0)
+                    except Exception:
+                        pass
         try:
             eh_cls = self._emulator.getClass()
             f1 = eh_cls.getDeclaredField("emulator"); f1.setAccessible(True)
@@ -855,7 +1433,7 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
             f_map = parent.getDeclaredField("pcodeOpMap")
             f_map.setAccessible(True)
             op_map = f_map.get(state_mod)
-            handler = _ZeroReturning()
+            handler = behavior if behavior is not None else _ZeroReturning()
             installed = []
             for i in range(self._language.getNumberOfUserDefinedOpNames()):
                 name = str(self._language.getUserDefinedOpName(i))
@@ -867,10 +1445,10 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
             if installed:
                 log.debug(
                     "GhidraBackend: installed zero-returning stubs for %d "
-                    "ARM CALLOTHER pcodeops: %s", len(installed),
+                    "%s CALLOTHER pcodeops: %s", label, len(installed),
                     ", ".join(installed),
                 )
         except Exception as e:  # noqa: BLE001
             log.warning(
-                "GhidraBackend: ARM CALLOTHER stub install failed: %s", e,
+                "GhidraBackend: %s CALLOTHER stub install failed: %s", label, e,
             )

@@ -1,0 +1,30 @@
+# NVIDIA Pascal GP102 FECS microcode -- the Falcon microcontroller inside the
+# GPU's graphics block.  Firmware is the redistributable blob from
+# linux-firmware (nvidia/gp102/gr/fecs_inst.bin).
+machine:
+  arch: falcon
+  cpu_model: fuc5
+  entry_addr: 0x0
+  init_sp: 0x4000          # top of DMEM
+
+memories:
+  # IMEM: instruction memory holds the image.  Falcon is Harvard, so data
+  # lives in a separate space -- see dmem below.
+  # fetch fecs_inst.bin from linux-firmware -- see README.md
+  imem: {base_addr: 0x00000000, file: fecs_inst.bin, permissions: rwx,
+         size: 0x8000}
+  # DMEM: data + stack.
+  dmem: {base_addr: 0x0, size: 0x4000, permissions: rw, space: dmem}
+  # Engine MMIO. `emulate:` attaches the engine model, which is what supplies
+  # engine status, the interrupt set/clear/status triples, INTR_MODE and
+  # INTR_ROUTING, the periodic and watchdog timers and the mailbox. Without it
+  # the range is plain memory: the firmware's status polls never succeed and no
+  # interrupt can ever be raised.
+  io:
+    base_addr: 0x0
+    size: 0x40000
+    permissions: rw
+    space: io
+    emulate: halucinator.peripheral_models.falcon_engine.FalconEngine
+
+intercepts: []

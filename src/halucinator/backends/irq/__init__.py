@@ -92,6 +92,10 @@ _DEFAULTS: Dict[str, Optional[IrqControllerSpec]] = {
     "powerpc":   None,
     "ppc64":     None,
     "powerpc:MPC8XX": None,
+    # Falcon has one architected controller in its own I/O space, so it
+    # needs no platform-specific base address and can default.
+    "falcon":      IrqControllerSpec(type="falcon"),
+    "falcon-fuc4": IrqControllerSpec(type="falcon"),
 }
 
 
@@ -112,6 +116,9 @@ def _instantiate(spec: IrqControllerSpec) -> IrqController:
     if spec.type == "cortex_m":
         from .cortex_m import CortexMController
         return CortexMController()
+    if spec.type == "falcon":
+        from .falcon import FalconIrqController
+        return FalconIrqController()
     if spec.type in ("gicv2", "gicv3"):
         from .gic import GicController
         if spec.gicd_base is None:

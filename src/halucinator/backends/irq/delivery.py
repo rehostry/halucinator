@@ -84,6 +84,14 @@ class DeliveryPlan:
     # so a polling firmware loop sees the IRQ without any ISR running.
     irq_fired_addr: Optional[int] = None
     irq_number_addr: Optional[int] = None
+    # Falcon: which of the two interrupt vectors ($iv0/$iv1) this line is
+    # routed to. Real hardware decides this in INTR_ROUTING; the rehost takes
+    # it from config because there is no host to program that register.
+    falcon_vector: int = 0
+    # Falcon: the data-space name the stack lives in. Falcon is Harvard, so
+    # the return address pushed on exception entry must go to DMEM, not to
+    # the code space a plain write_memory would target.
+    stack_space: Optional[str] = None
     # Arch-specific delivery data not yet modelled by a dedicated field
     # (e.g. x86 int_ent/int_exit/stub_addr, mips *_phys_addr). Carried
     # losslessly so the back-compat shim never drops a configured value;
@@ -581,6 +589,71 @@ class X86ExceptionDeliverer(ExceptionDeliverer):
 
 
 # ---------------------------------------------------------------------------
+# NVIDIA Falcon
+# ---------------------------------------------------------------------------
+
+
+class FalconExceptionDeliverer(ExceptionDeliverer):
+    """Falcon interrupt entry, verbatim from envytools docs/hw/falcon/intr.rst
+    ("Interrupt delivery")::
+
+        $sp -= 4;
+        ST(32, $sp, $pc);
+        $flags.is0 = $flags.ie0;
+        $flags.is1 = $flags.ie1;
+        $flags.ie0 = 0;
+        $flags.ie1 = 0;
+        $pc = $iv0  (vector 0)  or  $iv1  (vector 1)
+
+    The ieX bits are the enables and gate delivery; the isX bits save them for
+    the handler's `reti`. Both enables are always cleared on entry.
+
+    Falcon is Harvard, so the pushed return address goes to the data space --
+    ``plan.stack_space`` names it. Writing it to the default space would
+    silently corrupt the instruction stream instead.
+    """
+
+    arch = "falcon"
+
+    def deliver(self, backend: "HalBackend", num: int,
+                plan: DeliveryPlan) -> bool:
+        vec = 1 if plan.falcon_vector else 0
+
+        ie0 = backend.read_register("Ie0") & 1
+        ie1 = backend.read_register("Ie1") & 1
+        if (ie1 if vec else ie0) == 0:
+            hal_log.getHalLogger().debug(
+                "Falcon IRQ %s suppressed: ie%d clear", num, vec)
+            return False
+
+        vector = backend.read_register("iv1" if vec else "iv0")
+        if not vector:
+            # The firmware installs $ivX itself; a rehost that has not reached
+            # that code yet can still be driven from config.
+            vector = plan.isr_addr or 0
+            if not vector:
+                hal_log.getHalLogger().warning(
+                    "Falcon IRQ %s: $iv%d is 0 and no isr_addr configured; "
+                    "refusing to jump to address 0", num, vec)
+                return False
+
+        sp = (backend.read_register("sp") - 4) & 0xFFFFFFFF
+        pc = backend.read_register("pc")
+        kw = {"space": plan.stack_space} if plan.stack_space else {}
+        backend.write_memory(sp, 4, pc, **kw)
+        backend.write_registers({
+            "sp": sp,
+            "Is0": ie0, "Is1": ie1,      # save the enables for reti
+            "Ie0": 0,   "Ie1": 0,        # both always cleared on entry
+            "pc": vector,
+        })
+        hal_log.getHalLogger().info(
+            "Falcon IRQ %s -> vector %d @0x%x (pushed pc 0x%x, sp 0x%x)",
+            num, vec, vector, pc, sp)
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -592,6 +665,10 @@ _DELIVERER_CLASSES = {
     "powerpc:MPC8XX": ShadowExceptionDeliverer,
     "ppc64": ShadowExceptionDeliverer,
     "x86": X86ExceptionDeliverer,
+    # Falcon takes no hardware exception in the p-code emulator, so entry
+    # is synthesised here exactly as intr.rst specifies.
+    "falcon": FalconExceptionDeliverer,
+    "falcon-fuc4": FalconExceptionDeliverer,
 }
 
 

@@ -190,6 +190,29 @@ def _get_halucinator_targets() -> Dict[str, Dict[str, Any]]:
         # never invoked on the unicorn path (which reads the mode from
         # unicorn_backend._ARCH_MAP). Registered here purely so HalConfig's
         # `arch not in HALUCINATOR_TARGETS` validation accepts the config.
+        # NVIDIA Falcon -- the microcontroller embedded in NVIDIA GPUs (PMU,
+        # SEC2, GSP, and the FECS/GPCCS context engines in the graphics block).
+        # Ghidra backend only: Unicorn has no Falcon target and there is no
+        # falcon-softmmu, so the p-code emulator is the only way to run it.
+        # Needs the ghidra-falcon processor module installed in Ghidra.
+        "falcon": {
+            "avatar_arch": None,
+            "qemu_target": lambda: (_ for _ in ()).throw(
+                NotImplementedError(
+                    "falcon runs on the in-process ghidra backend only "
+                    "(--emulator ghidra); no avatar2/qemu/unicorn Falcon target")),
+            "qemu_env_var": None,
+            "qemu_default_path": None,
+        },
+        "falcon-fuc4": {
+            "avatar_arch": None,
+            "qemu_target": lambda: (_ for _ in ()).throw(
+                NotImplementedError(
+                    "falcon runs on the in-process ghidra backend only "
+                    "(--emulator ghidra)")),
+            "qemu_env_var": None,
+            "qemu_default_path": None,
+        },
         "m68k": {
             "avatar_arch": None,
             "qemu_target": lambda: (_ for _ in ()).throw(

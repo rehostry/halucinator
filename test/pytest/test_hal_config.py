@@ -243,3 +243,59 @@ class TestHalucinatorConfig:
         assert hc.watchpoints == []
         assert hc.symbols == []
         assert hc.callables == []
+
+
+def test_the_falcon_config_loads():
+    """test/falcon_fecs/falcon_fecs.yaml must parse, `space:` keys included.
+
+    It did not. The loader rejected the very key that config's own README tells
+    people to use, so the documented way to run Falcon raised a TypeError
+    before doing anything -- while the Python scripts used for verification
+    built MemoryRegion(space=...) directly and worked fine.
+    """
+    import pathlib
+
+    from halucinator.hal_config import HalucinatorConfig
+
+    cfg_path = (pathlib.Path(__file__).resolve().parents[1]
+                / "falcon_fecs" / "falcon_fecs.yaml")
+    if not cfg_path.is_file():
+        import pytest
+        pytest.skip(f"{cfg_path} missing")
+    cfg = HalucinatorConfig()
+    cfg.add_yaml(str(cfg_path))
+    assert cfg.machine.arch == "falcon"
+    spaces = {n: m.space for n, m in cfg.memories.items()}
+    assert spaces == {"imem": None, "dmem": "dmem", "io": "io"}, spaces
+
+
+def test_config_regions_keep_their_space_and_peripheral():
+    """A parsed config entry must reach the backend with space and emulate.
+
+    The Ghidra path built its MemoryRegion inline and passed neither. The
+    symptom was quiet: a Falcon config's dmem and io were created in the
+    default space, rejected as overlapping imem, and skipped -- and the engine
+    the config asked for was never attached, so nothing the firmware polled
+    could ever change.
+    """
+    import pathlib
+
+    import pytest
+
+    from halucinator.hal_config import HalucinatorConfig
+    from halucinator.main import memory_region_from_config
+    from halucinator.peripheral_models.falcon_engine import FalconEngine
+
+    cfg_path = (pathlib.Path(__file__).resolve().parents[1]
+                / "falcon_fecs" / "falcon_fecs.yaml")
+    if not cfg_path.is_file():
+        pytest.skip(f"{cfg_path} missing")
+    cfg = HalucinatorConfig()
+    cfg.add_yaml(str(cfg_path))
+    regions = {m.name: memory_region_from_config(m)
+               for m in cfg.memories.values()}
+    assert regions["dmem"].space == "dmem"
+    assert regions["io"].space == "io"
+    assert regions["imem"].space is None
+    assert regions["io"].emulate is FalconEngine
+    assert regions["dmem"].emulate is None
