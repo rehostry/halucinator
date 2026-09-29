@@ -186,3 +186,29 @@ def test_repeated_switches_are_deterministic():
     assert unload[0] == 0, f"second request should unload, gave {unload}"
     assert again == first, f"reload differed from the first load: {again} vs {first}"
     assert be._step_fault_pc is None
+
+
+def test_a_fecs_method_is_received_and_acknowledged():
+    """The host's command path, end to end into the microcode.
+
+    Nouveau drives FECS by writing BAR0 0x409500 (argument) and 0x409504
+    (method) and polling 0x409800 for a reply. The firmware never reads that
+    submission window: the hardware forwards the write into the falcon's own
+    method FIFO, and the microcode takes it from there on interrupt line 2,
+    reading FIFO_CMD and FIFO_DATA and writing FIFO_ACK when done.
+
+    This asserts the method is consumed -- that the whole path from a driver
+    register write to the microcode's acknowledgement is connected. It does
+    *not* assert a reply: discover_image_size answers only after the long init
+    sequence nouveau performs first, which this does not yet replay.
+    """
+    from halucinator.peripheral_models.falcon_ctxctl import (
+        MTHD_DISCOVER_IMAGE_SIZE)
+
+    be, eng, _ = _boot()
+    eng.fecs_method(MTHD_DISCOVER_IMAGE_SIZE, 0)
+    assert eng._fifo, "method was not queued"
+    _run(be)
+    assert not eng._fifo, "firmware never acknowledged the method"
+    assert eng.methods == [(MTHD_DISCOVER_IMAGE_SIZE, 0)]
+    assert be._step_fault_pc is None

@@ -110,6 +110,41 @@ IO_DEFAULTS = {
     0x19000: 0xFFFFFFFF,
 }
 
+# FIFO range (0x14000): the command interface the host drives FECS through.
+# Nouveau (nvkm/engine/gr/gf100.c) writes BAR0 0x409500 then 0x409504 and polls
+# 0x409800 for the answer; those are WRCMD_DATA, WRCMD_CMD and the first
+# scratch register, at falcon IO 0x14000, 0x14100 and 0x20000.
+WRCMD_DATA = 0x14000
+WRCMD_CMD = 0x14100
+
+# The falcon's own method FIFO (rnndb falcon.xml, BAR0 0x64-0x74). The host
+# writes WRCMD_DATA/WRCMD_CMD and the hardware pushes an entry here; the
+# microcode is interrupted, reads the method and its argument, and acks.
+#
+# This is how a method actually reaches the firmware. GP102 FECS never reads
+# the 0x14000 command window at all -- that is the submission side, which the
+# host writes and the hardware forwards. The interrupt handler at 0x2bb reads
+# FIFO_CMD and FIFO_DATA when INTR line 2 is pending and writes FIFO_ACK when
+# it is done, which is what identifies line 2 as the method-pending line.
+FIFO_DATA = 0x01900
+FIFO_CMD = 0x01A00
+FIFO_OCCUPIED = 0x01C00
+FIFO_ACK = 0x01D00
+METHOD_IRQ_LINE = 2
+
+# MISC range (0x20000) is the scratch/mailbox block -- BAR0 0x409800 upwards.
+# It is the biggest single block of registers the firmware touches, and being
+# "misc/unknown stuff" upstream is why that was not obvious.
+SCRATCH0 = 0x20000
+SCRATCH1 = 0x20100
+
+# FECS methods, from the driver that issues them.
+MTHD_DISCOVER_IMAGE_SIZE = 0x10
+MTHD_DISCOVER_ZCULL_IMAGE_SIZE = 0x16
+MTHD_SET_WATCHDOG_TIMEOUT = 0x21
+MTHD_DISCOVER_PM_IMAGE_SIZE = 0x25
+MTHD_DISCOVER_REGLIST_IMAGE_SIZE = 0x30
+
 # MEMIF range (0x28000): the memory interface the context save and restore run
 # through. Names from rnndb ctxctl.xml.
 MEM_BASE = 0x28100
@@ -171,6 +206,29 @@ class FalconCtxctl(FalconEngine):
         self.mem_chan = 0
         self.mem_target = 0
         self.mem_commands = []
+        self.wrcmd_data = 0
+        self.wrcmd_cmd = 0
+        self.scratch0 = 0
+        self.scratch1 = 0
+        self.methods = []
+        self._fifo = []
+
+    def fecs_method(self, method: int, arg: int = 0) -> None:
+        """Issue a FECS method the way the host driver does.
+
+        Nouveau clears the scratch register, writes the argument, then writes
+        the method -- and the write of the method is what sets the microcode
+        going. The answer comes back in the same scratch register, which is
+        why it is cleared first: a non-zero read is how the driver knows the
+        reply has arrived.
+        """
+        self.scratch0 = 0
+        self.wrcmd_data = arg & 0xFFFFFFFF
+        self.wrcmd_cmd = method & 0xFFFFFFFF
+        self.methods.append((method, arg))
+        self._fifo.append((method & 0xFFFFFFFF, arg & 0xFFFFFFFF))
+        self.raise_line(METHOD_IRQ_LINE)
+        log.info("%s: FECS method 0x%02x arg 0x%08x", self.name, method, arg)
 
     # -- the host side -----------------------------------------------------
 
@@ -249,6 +307,8 @@ class FalconCtxctl(FalconEngine):
             MMCTX_SAVE_SWBASE, MMCTX_LOAD_SWBASE,
             CURRENT_CTX, NEW_CTX, GRAPH_ENGINE_STATUS, ENGINE_TRIGGER,
             MEM_BASE, MEM_CHAN, MEM_CMD, MEM_TARGET,
+            WRCMD_DATA, WRCMD_CMD, SCRATCH0, SCRATCH1,
+            FIFO_DATA, FIFO_CMD, FIFO_OCCUPIED, FIFO_ACK,
         )
 
     def hw_read(self, offset: int, size: int, pc: int = 0xBAADBAAD,
@@ -265,6 +325,22 @@ class FalconCtxctl(FalconEngine):
             return self.mmctx_save_base
         if offset == MMCTX_LOAD_SWBASE:
             return self.mmctx_load_base
+        if offset == FIFO_CMD:
+            return self._fifo[0][0] if self._fifo else 0
+        if offset == FIFO_DATA:
+            return self._fifo[0][1] if self._fifo else 0
+        if offset == FIFO_OCCUPIED:
+            return len(self._fifo)
+        if offset == FIFO_ACK:
+            return 0
+        if offset == WRCMD_DATA:
+            return self.wrcmd_data
+        if offset == WRCMD_CMD:
+            return self.wrcmd_cmd
+        if offset == SCRATCH0:
+            return self.scratch0
+        if offset == SCRATCH1:
+            return self.scratch1
         if offset == MEM_BASE:
             return self.mem_base
         if offset == MEM_CHAN:
@@ -298,6 +374,24 @@ class FalconCtxctl(FalconEngine):
             return True
         if offset == MMCTX_LOAD_SWBASE:
             self.mmctx_load_base = value & 0xFFFFFFFF
+            return True
+        if offset == FIFO_ACK:
+            if self._fifo:
+                done = self._fifo.pop(0)
+                log.info("%s: method 0x%02x acknowledged", self.name, done[0])
+            return True
+        if offset == WRCMD_DATA:
+            self.wrcmd_data = value & 0xFFFFFFFF
+            return True
+        if offset == WRCMD_CMD:
+            self.wrcmd_cmd = value & 0xFFFFFFFF
+            return True
+        if offset == SCRATCH0:
+            self.scratch0 = value & 0xFFFFFFFF
+            log.info("%s: scratch0 <- 0x%08x", self.name, self.scratch0)
+            return True
+        if offset == SCRATCH1:
+            self.scratch1 = value & 0xFFFFFFFF
             return True
         if offset == MEM_BASE:
             self.mem_base = value & 0xFFFFFFFF
