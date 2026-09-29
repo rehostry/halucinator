@@ -48,6 +48,26 @@ MMIO_WRVAL = 0x1CC00         # rnndb: MMIO_WRVAL
 MMCTX_SAVE_SWBASE = 0x1C000
 MMCTX_LOAD_SWBASE = 0x1C100
 
+# CSREQ range (0x2c000): which channel is loaded, and which one to switch to.
+CURRENT_CTX = 0x2C000
+NEW_CTX = 0x2C100
+CTX_VALID = 1 << 31
+CTX_CHAN_MASK = 0x7FFFFFFF
+
+# GRAPH range (0x30000). rnndb calls this ENGINE_STATUS; the falcon's own
+# status register is SIGNAL, so it is spelled out here to keep them apart.
+GRAPH_ENGINE_STATUS = 0x30000
+ENGINE_TRIGGER = 0x30200
+ES_CHSW_PENDING = 1 << 0
+ES_CHAN_VALID = 1 << 1
+ES_CHSW_PULSE = 1 << 3
+ES_IDLE_BUSY = 1 << 13
+
+# The falcon interrupt line PFIFO's switch request arrives on. Derived by
+# raising each line the firmware enables (INTR_EN = 0x8704 -> lines 2, 8, 9,
+# 10, 15) and seeing which one makes it acknowledge the switch.
+CHSW_IRQ_LINE = 8
+
 CTRL_GO = 1 << 31
 CTRL_ADDR_MASK = 0x03FFFFFC
 CTRL_OP_SHIFT, CTRL_OP_MASK = 29, 0x3
@@ -117,6 +137,35 @@ class FalconCtxctl(FalconEngine):
         self.mmio_writes = 0
         self.mmctx_save_base = 0
         self.mmctx_load_base = 0
+        # Context-switch state, as PFIFO would present it.
+        self.current_ctx = 0
+        self.new_ctx = 0
+        self.engine_status = 0
+        self.engine_trigger = 0
+        self.switch_requests = 0
+
+    # -- the host side -----------------------------------------------------
+
+    def request_context_switch(self, channel: int, valid: bool = True) -> None:
+        """Ask the firmware to switch to `channel`, as PFIFO does.
+
+        PFIFO publishes the channel in NEW_CTX and raises CHSW_PENDING; the
+        microcode notices, saves whatever CURRENT_CTX names and loads the new
+        one. Nothing else in this model drives that -- without a caller the
+        firmware sits in its idle loop forever, which is the correct behaviour
+        for a GPU with no work queued.
+        """
+        self.new_ctx = (channel & CTX_CHAN_MASK) | (CTX_VALID if valid else 0)
+        self.engine_status |= ES_CHSW_PENDING | (ES_CHAN_VALID if valid else 0)
+        self.switch_requests += 1
+        # The request only reaches the microcode as an interrupt. Line 8 is the
+        # one that carries it: raising each enabled engine line in turn from an
+        # identical post-boot state, line 8 is the only one after which the
+        # firmware writes CURRENT_CTX, and it executes 393 instructions it
+        # never reaches otherwise.
+        self.raise_line(CHSW_IRQ_LINE)
+        log.info("%s: context switch requested -> channel 0x%x",
+                 self.name, channel & CTX_CHAN_MASK)
 
     # -- the GPU register file --------------------------------------------
 
@@ -170,6 +219,7 @@ class FalconCtxctl(FalconEngine):
         return tuple(super().live_registers()) + (
             MMIO_CTRL, MMIO_RDVAL, MMIO_WRVAL,
             MMCTX_SAVE_SWBASE, MMCTX_LOAD_SWBASE,
+            CURRENT_CTX, NEW_CTX, GRAPH_ENGINE_STATUS, ENGINE_TRIGGER,
         )
 
     def hw_read(self, offset: int, size: int, pc: int = 0xBAADBAAD,
@@ -186,6 +236,14 @@ class FalconCtxctl(FalconEngine):
             return self.mmctx_save_base
         if offset == MMCTX_LOAD_SWBASE:
             return self.mmctx_load_base
+        if offset == CURRENT_CTX:
+            return self.current_ctx
+        if offset == NEW_CTX:
+            return self.new_ctx
+        if offset == GRAPH_ENGINE_STATUS:
+            return self.engine_status
+        if offset == ENGINE_TRIGGER:
+            return self.engine_trigger
         if offset in IO_DEFAULTS and offset not in self.registers:
             return IO_DEFAULTS[offset]
         return super().hw_read(offset, size, pc=pc, **kwargs)
@@ -205,5 +263,21 @@ class FalconCtxctl(FalconEngine):
             return True
         if offset == MMCTX_LOAD_SWBASE:
             self.mmctx_load_base = value & 0xFFFFFFFF
+            return True
+        if offset == CURRENT_CTX:
+            # The microcode publishes the context it has loaded. Writing it is
+            # how it tells the host the switch is done.
+            self.current_ctx = value & 0xFFFFFFFF
+            log.info("%s: CURRENT_CTX <- 0x%08x", self.name, self.current_ctx)
+            return True
+        if offset == NEW_CTX:
+            self.new_ctx = value & 0xFFFFFFFF
+            return True
+        if offset == GRAPH_ENGINE_STATUS:
+            # Acknowledging a switch clears the pending bit.
+            self.engine_status = value & 0xFFFFFFFF
+            return True
+        if offset == ENGINE_TRIGGER:
+            self.engine_trigger = value & 0xFFFFFFFF
             return True
         return super().hw_write(offset, size, value, pc=pc, **kwargs)
