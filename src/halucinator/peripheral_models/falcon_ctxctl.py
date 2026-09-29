@@ -77,6 +77,8 @@ OP_READ, OP_WRITE_A, OP_WRITE_B = 0, 2, 3
 SIGNAL_MMIO_RD_DONE = 1 << 6
 SIGNAL_MMIO_WRS_DONE = 1 << 7
 SIGNAL_MMCTX_DONE = 1 << 14
+SIGNAL_BAR_0 = 1 << 8
+SIGNAL_BAR_1 = 1 << 9
 
 # PRI-bus set/clear/status triples, as (set, status, clear). Derived from the
 # firmware's own use: it writes the set register, then polls status until it
@@ -108,6 +110,20 @@ IO_DEFAULTS = {
     0x19000: 0xFFFFFFFF,
 }
 
+# MEMIF range (0x28000): the memory interface the context save and restore run
+# through. Names from rnndb ctxctl.xml.
+MEM_BASE = 0x28100
+MEM_CHAN = 0x28300
+MEM_CMD = 0x28400
+MEM_TARGET = 0x28800
+
+# Command fields hardware clears once it has carried the command out. The
+# firmware writes MEM_CMD and then spins on `MEM_CMD & 0x1f` until it reads
+# zero, so a register that simply stores the command never lets it continue.
+IO_SELF_CLEARING = {
+    MEM_CMD: 0x1F,
+}
+
 # The same question on the BAR0 side. Each of these is polled until every bit
 # reads 1 -- the firmware is waiting for a set of units to report done, and
 # with no units modelled the only answer that lets it proceed is "all of them".
@@ -129,7 +145,15 @@ class FalconCtxctl(FalconEngine):
         # SIGNAL (CC 0x10000) is the base engine's ENGINE_STATUS. Its static
         # ready_bits are what the firmware's early polls need; these are the
         # bits the MMIO bus raises as it completes work.
-        self.intr_signal = 0
+        # Barriers synchronise the HUB controller (FECS) with the per-GPC
+        # controllers (GPCCS). With no GPC units modelled there is nobody else
+        # to arrive, so every barrier is satisfied the moment it is asked
+        # about. Left clear, the firmware waits at its first barrier forever.
+        #
+        # This is a statement about the modelled system, not about hardware: a
+        # rehost that later co-simulates GPCCS must drive these from the real
+        # barrier state instead.
+        self.intr_signal = SIGNAL_BAR_0 | SIGNAL_BAR_1
         self._rdval = 0
         self._wrval = 0
         self._ctrl = 0
@@ -143,6 +167,10 @@ class FalconCtxctl(FalconEngine):
         self.engine_status = 0
         self.engine_trigger = 0
         self.switch_requests = 0
+        self.mem_base = 0
+        self.mem_chan = 0
+        self.mem_target = 0
+        self.mem_commands = []
 
     # -- the host side -----------------------------------------------------
 
@@ -220,6 +248,7 @@ class FalconCtxctl(FalconEngine):
             MMIO_CTRL, MMIO_RDVAL, MMIO_WRVAL,
             MMCTX_SAVE_SWBASE, MMCTX_LOAD_SWBASE,
             CURRENT_CTX, NEW_CTX, GRAPH_ENGINE_STATUS, ENGINE_TRIGGER,
+            MEM_BASE, MEM_CHAN, MEM_CMD, MEM_TARGET,
         )
 
     def hw_read(self, offset: int, size: int, pc: int = 0xBAADBAAD,
@@ -236,6 +265,12 @@ class FalconCtxctl(FalconEngine):
             return self.mmctx_save_base
         if offset == MMCTX_LOAD_SWBASE:
             return self.mmctx_load_base
+        if offset == MEM_BASE:
+            return self.mem_base
+        if offset == MEM_CHAN:
+            return self.mem_chan
+        if offset == MEM_TARGET:
+            return self.mem_target
         if offset == CURRENT_CTX:
             return self.current_ctx
         if offset == NEW_CTX:
@@ -263,6 +298,24 @@ class FalconCtxctl(FalconEngine):
             return True
         if offset == MMCTX_LOAD_SWBASE:
             self.mmctx_load_base = value & 0xFFFFFFFF
+            return True
+        if offset == MEM_BASE:
+            self.mem_base = value & 0xFFFFFFFF
+            return True
+        if offset == MEM_CHAN:
+            self.mem_chan = value & 0xFFFFFFFF
+            return True
+        if offset == MEM_TARGET:
+            self.mem_target = value & 0xFFFFFFFF
+            return True
+        if offset == MEM_CMD:
+            cmd = value & 0xFFFFFFFF
+            self.mem_commands.append((cmd, self.mem_chan, self.mem_base,
+                                      self.mem_target))
+            log.info("%s: MEM_CMD 0x%x (chan 0x%08x base 0x%08x target 0x%x)",
+                     self.name, cmd & 0x1F, self.mem_chan, self.mem_base,
+                     self.mem_target)
+            self.registers[MEM_CMD] = cmd & ~IO_SELF_CLEARING[MEM_CMD]
             return True
         if offset == CURRENT_CTX:
             # The microcode publishes the context it has loaded. Writing it is

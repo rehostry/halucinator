@@ -116,6 +116,39 @@ def test_it_performs_a_context_switch():
     assert len(after - before) > 100, "no new code path was taken"
 
 
+def test_the_switch_issues_a_memory_command_for_that_channel():
+    """A switch is not just a handshake: the context has to be moved.
+
+    The microcode programs MEMIF with the channel PFIFO gave it and issues a
+    command, which is the request to move that channel's context. Asserting the
+    command carries *our* channel is what separates "it ran some code" from
+    "it acted on the request".
+    """
+    be, eng, _ = _boot()
+    eng.request_context_switch(CHANNEL)
+    _run(be)
+    assert eng.mem_commands, "no MEMIF command was issued"
+    _cmd, chan, _base, _target = eng.mem_commands[0]
+    from halucinator.peripheral_models.falcon_ctxctl import CTX_VALID
+    assert chan == (CHANNEL | CTX_VALID), (
+        f"MEMIF command carried channel 0x{chan:08x}")
+
+
+def test_the_switch_finishes_and_returns_to_idle():
+    """It must come back, not stall somewhere in the middle.
+
+    The dispatcher's idle exit is the same code the firmware runs when it has
+    nothing to do, so reaching it again after the switch is how we know the
+    work ended rather than hung.
+    """
+    be, eng, before = _boot()
+    eng.request_context_switch(CHANNEL)
+    after = _run(be)
+    assert eng.current_ctx == (CHANNEL | 0x80000000)
+    assert before & after, "never returned to any previously-idle code"
+    assert be._step_fault_pc is None
+
+
 def test_without_a_request_it_never_switches():
     """The control. Idle for the same budget and CURRENT_CTX stays empty."""
     be, eng, before = _boot()
