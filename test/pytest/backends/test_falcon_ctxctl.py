@@ -155,3 +155,34 @@ def test_without_a_request_it_never_switches():
     after = _run(be)
     assert eng.current_ctx == 0
     assert eng.switch_requests == 0
+
+
+def test_repeated_switches_are_deterministic():
+    """Load, unload, load again -- and the second load matches the first.
+
+    Each request drives one half of a switch: the first loads the channel and
+    publishes it in CURRENT_CTX, the next saves it and leaves CURRENT_CTX
+    empty, and the third loads it again. Asserting the third reproduces the
+    first -- the same channel, the same number of MEMIF commands, the same
+    volume of register traffic -- is what makes this a cycle rather than a
+    one-off.
+
+    What it is NOT: a check on the *contents* of a context image. The bulk of
+    the state a real switch moves lives in the GPU, not in the firmware or its
+    register file, and nothing here models that. Two loads agreeing shows the
+    firmware's own path is repeatable; it says nothing about what was copied.
+    """
+    be, eng, _ = _boot()
+    marks = []
+    for chan in (0x1111, 0x2222, 0x1111):
+        before = (len(eng.mem_commands), eng.mmio_writes)
+        eng.request_context_switch(chan)
+        _run(be)
+        marks.append((eng.current_ctx,
+                      len(eng.mem_commands) - before[0],
+                      eng.mmio_writes - before[1]))
+    first, unload, again = marks
+    assert first[0] == 0x1111 | 0x80000000, f"first load gave {first}"
+    assert unload[0] == 0, f"second request should unload, gave {unload}"
+    assert again == first, f"reload differed from the first load: {again} vs {first}"
+    assert be._step_fault_pc is None
