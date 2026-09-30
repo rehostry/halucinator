@@ -37,3 +37,25 @@ interrupt entry saves only `ie0`/`ie1` (intr.rst), so without it the handler's
 exits early. The first version of this firmware had that bug, and the rehost
 reproduced it faithfully -- as does GP102 FECS's own handler, which saves
 `$flags` through `$r10` across its work.
+
+## The multi-register stack family
+
+`mpush`/`mpop`/`mpopret`/`mpopadd`/`mpopaddret` have no upstream documentation
+at all -- envydis carries the encodings and the comment "Display these in a
+better way, perhaps?" -- so their semantics are derived from shipped GP102
+firmware, and this firmware is where the derivation is checked.
+
+Two properties, both once read wrongly:
+
+- **The operand names the highest register saved.** `mpush $r3` pushes r0-r3,
+  four words. `clobber` overwrites exactly r0-r3, which puts the boundary
+  register under test rather than only the middle of the range.
+
+- **`mpopaddret`'s immediate is applied before the return address is popped.**
+  A framed function allocates locals first and saves registers second, so the
+  frame sits between the saved registers and the return address and has to be
+  reclaimed first. `farroutine` fills its own frame with 0xdead: get the order
+  wrong and the return leaves IMEM and the run faults, instead of producing a
+  wrong number that could be mistaken for something else.
+
+Reverting either property fails six of the tests, so they are load-bearing.

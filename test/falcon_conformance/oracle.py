@@ -172,7 +172,8 @@ def expected():
     """Every word the firmware must leave in DMEM."""
     sum_sq, mix, alu = _sum_sq(), _mix(), _alu()
     # r0..r3 = 0x11,0x22,0x33,0x44 must survive `clobber`, which saves them
-    # with `mpush $r4` and then overwrites all four.
+    # with `mpush $r3` -- the operand names the highest register saved -- and
+    # then overwrites all four.
     regs = 0x11223344
     dma = DMA_PATTERN          # written to DMEM, pushed out by xdst, read back
     tlb = _tlb()

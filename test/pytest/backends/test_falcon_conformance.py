@@ -153,12 +153,13 @@ def test_the_alu_chain_is_right(run):
 
 
 def test_mpush_preserves_the_registers_below_it(run):
-    """`mpush $r4` must save r0-r3 across a callee that destroys all four.
+    """`mpush $r3` must save r0-r3 across a callee that destroys all four.
 
     This pins a semantic that is derived rather than documented: the operand
-    is a count, not a single register. Under the single-register reading the
-    callee's writes reach the caller and this word is 0xDEADBEEF-ish garbage
-    instead of 0x11223344.
+    names the highest register saved, so four registers go on the stack. The
+    callee overwrites exactly r0-r3, which puts the boundary register under
+    test -- read the operand as an exclusive count and r3 comes back 0xEF; read
+    it as a single register and r0-r2 are lost too.
     """
     _, _, got = run
     assert got["regs"] == 0x11223344
@@ -313,7 +314,11 @@ def test_the_remaining_arithmetic(run):
 
 def test_iord_extrs_and_a_far_call(run):
     """iord reads back what iowr wrote; extrs sign-extends where extr does
-    not; and a far callee returning through mpopaddret leaves r0 intact."""
+    not; and a far callee returning through mpopaddret leaves r0 intact.
+
+    The callee poisons its own local frame with 0xdead, so `mpopaddret` taking
+    the return address before giving the frame back sends the run out of IMEM
+    rather than leaving a wrong number here."""
     _, _, got = run
     assert got["misc2"] == oracle._misc2()
 

@@ -14,7 +14,7 @@
 //   0x08 sum_sq      sum of i*i for i = 1..64, computed through call/ret
 //   0x0c done        every other word XORed together, written last
 //   0x10 alu         a chain over and/or/xor/shl/sar/hswap/xbit/sext/not/neg
-//   0x14 regs        proof that `mpush $r4` really preserved r0-r3
+//   0x14 regs        proof that `mpush $r3` really preserved r0-r3
 //   0x18 dma         a DMEM -> external -> DMEM round trip through xdst/xdld
 //   0x1c tlb         ptlb/vtlb/itlb after a code load, folded together
 //   0x20 sized       b8/b16 arithmetic must wrap, and set flags from bit sz-1
@@ -139,12 +139,14 @@ sumloop:
         mov $r1 0x10
         st b32 D[$r1] $r6
 
-// -- does `mpush $r4` actually preserve r0-r3? -----------------------------
+// -- does `mpush $r3` actually preserve r0-r3? -----------------------------
 // This is the test for a semantic that is *derived*, not documented: the
-// operand is read as a count, so `mpush $r4` saves r0-r3. Model it as a
-// single-register push instead and `clobber` destroys the caller's values,
-// this word comes out different, and the run fails here rather than silently
-// computing something wrong somewhere else later.
+// operand names the HIGHEST register saved, so `mpush $r3` saves r0-r3 --
+// four registers, not three and not one. `clobber` overwrites exactly r0-r3,
+// so the boundary register r3 is the one that decides it: read the operand as
+// an exclusive count and r3 comes back 0xef, read it as a single register and
+// r0-r2 are lost too. Either way this word changes and the run fails here
+// rather than silently computing something wrong somewhere else later.
         mov $r0 0x11
         mov $r1 0x22
         mov $r2 0x33
@@ -288,22 +290,22 @@ sumloop:
 // adjustment are right.
         mov $r0 0xa1
         mov $r1 0xb2
-        mpush $r2                       // saves r0, r1
+        mpush $r1                       // saves r0 and r1
         mov $r0 0xee
         mov $r1 0xee
-        mpop $r2                        // restores both
+        mpop $r1                        // restores both
         shl b32 $r1 $r1 0x8
         or $r5 $r0 $r1                  // 0xb2a1 if mpop restored them
 
 // mpopadd pops and *then* adds, so the bytes it reclaims sit above the saved
-// block, not below it -- that is the caller-pushed-argument pattern GP102
-// FECS uses. An earlier version of this allocated the frame after the mpush
-// and the pop read from the wrong place.
-        add $sp -0x8                    // caller's two argument words
+// block -- the callee's own local frame, allocated before the push. That is
+// the shape every framed function in GP102 FECS uses: `add $sp -N`, `mpush`,
+// ... , `mpopadd`/`mpopaddret $rX N`.
+        add $sp -0x8                    // the local frame
         mov $r0 0xc3
-        mpush $r1                       // saves r0
+        mpush $r0                       // saves r0 alone
         mov $r0 0xee
-        mpopadd $r1 0x8                 // pop r0, then reclaim the 8 bytes
+        mpopadd $r0 0x8                 // pop r0, then reclaim the frame
         shl b32 $r0 $r0 0x10
         or $r5 $r5 $r0                  // 0xc3b2a1
         mov $r1 0x2c
@@ -385,8 +387,7 @@ sumloop:
         iowr I[$r12] $r13
         iord $r14 I[$r12]               // -> 0x1234
         sleep c
-// a far call whose callee returns through mpopaddret
-        add $sp -0x8
+// a far call whose callee returns through mpopaddret, frame and all
         mov $r0 0x77
         lcall #farroutine
         shl b32 $r0 $r0 0x10
@@ -512,12 +513,27 @@ v1handler:
         iret
 
 // -- a callee that returns through mpopaddret ------------------------------
-// The caller allocates two argument words before the call; mpopaddret pops
-// the saved registers and then reclaims them, which is the shape GP102 FECS
-// uses at 0x1be1.
+// The ordering test for the whole family, and the reason it is a *poisoned*
+// frame rather than an empty one.
+//
+// A framed function allocates its locals and only then saves registers, so
+// the stack from the top reads: saved registers, local frame, return address.
+// The epilogue has to give the frame back BEFORE it takes the return address,
+// or it returns to whatever is in the first local word. Every `mpopaddret`
+// in GP102 FECS is paired with an `add $sp -imm` prologue carrying the same
+// immediate, which is what fixes the order.
+//
+// Both local words hold 0xdead here. Apply the immediate too late and the
+// return goes to 0xdead, which is outside IMEM -- the run faults instead of
+// quietly returning a wrong number.
 farroutine:
-        mpush $r1                       // saves r0
+        add $sp -0x8                    // the local frame
+        mpush $r1                       // saves r0 and r1
+        mov $r9 0xdead
+        st b32 D[$sp+0x8] $r9           // first local word
+        st b32 D[$sp+0xc] $r9           // second local word
         mov $r0 0xee
+        mov $r1 0xee
         mpopaddret $r1 0x8
 
 // -- trap handler: record the reason from $tstatus, then return ------------
@@ -544,12 +560,12 @@ traphandler:
 
 // -- saves r0-r3 via mpush, destroys them, restores them on the way out ----
 clobber:
-        mpush $r4
+        mpush $r3
         mov $r0 0xde
         mov $r1 0xad
         mov $r2 0xbe
         mov $r3 0xef
-        mpopret $r4
+        mpopret $r3
 
 // -- $r2 = $r1 * $r1. Uses the DMEM stack for both push/pop and ret, which
 //    is the mix that catches a call pushing into the wrong address space.
