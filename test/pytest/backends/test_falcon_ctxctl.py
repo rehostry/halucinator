@@ -781,20 +781,48 @@ def _nouveau_context_registers():
     checkout.
     """
     import collections
+
+    table = collections.defaultdict(set)
+    for addr, count, _pitch, _data in _nouveau_context_entries():
+        table[addr].add(count)
+    return table
+
+
+def _nouveau_context_entries():
+    """nouveau's `struct gf100_gr_init` rows, as (addr, count, pitch, data)."""
     import re
 
     root = os.environ.get(NOUVEAU_ENV)
     if not root:
         pytest.skip(f"set {NOUVEAU_ENV} to nouveau's nvkm/engine/gr")
-    entry = re.compile(r"\{\s*(0x[0-9a-f]{6})\s*,\s*(\d+)\s*,\s*0x[0-9a-f]+\s*,")
-    table = collections.defaultdict(set)
+    entry = re.compile(
+        r"\{\s*(0x[0-9a-f]{6})\s*,\s*(\d+)\s*,\s*0x([0-9a-f]+)\s*,"
+        r"\s*(0x[0-9a-f]+)\s*\}")
     files = sorted(pathlib.Path(root).glob("ctx*.c"))
     if not files:
         pytest.skip(f"no ctx*.c under {root}")
+    rows = []
     for f in files:
         for m in entry.finditer(f.read_text(errors="ignore")):
-            table[int(m.group(1), 16)].add(int(m.group(2)))
-    return table
+            rows.append((int(m.group(1), 16), int(m.group(2)),
+                         int(m.group(3), 16), int(m.group(4), 16)))
+    return rows
+
+
+def _nouveau_register_defaults():
+    """{address: reset value} for the registers nouveau initialises.
+
+    The same tables as the decode cross-check, but a different column: that one
+    uses address and count, this one uses the data each row writes. Seeding the
+    model's register file with these gives a golden save real values to capture
+    instead of zeros, which is what makes an assertion over the whole image mean
+    something.
+    """
+    values = {}
+    for addr, count, pitch, data in _nouveau_context_entries():
+        for i in range(count):
+            values.setdefault(addr + i * pitch, data)
+    return values
 
 
 def test_the_saved_register_ranges_agree_with_nouveau_s_own_tables():
@@ -919,3 +947,48 @@ def test_a_load_from_a_base_never_saved_leaves_the_registers_alone():
     eng.hw_write(MMCTX_CTRL, 4, 0x1000 | MMCTX_DIR | MMCTX_STOP_TRIGGER)
     assert eng.mmctx_loaded == 0, "restored words that were never saved"
     assert [eng.bar0_read(reg + i * 4) for i in range(4)] == live
+
+
+def test_the_saved_image_carries_the_values_the_registers_held():
+    """Every word of the image, not just one sentinel.
+
+    The golden-save test above seeds a single register and checks its value
+    reaches the image. That is enough to show the read path works, but with an
+    unpopulated register file the other 227 words are zero, and "zero equals
+    zero" is not much of a check.
+
+    Seeding the register file with nouveau's reset values fixes that: 53 of the
+    228 registers the firmware saves have a non-zero value in those tables, so
+    the comparison covers distinct values at distinct addresses. A read path that
+    returned zeros, or one word shifted, would fail here and pass the sentinel.
+
+    The values come from a different column of the same tables the decode
+    cross-check uses -- data rather than address and count -- and the addresses
+    the firmware reads come from its own descriptors, so agreement is still
+    between two independent readings.
+    """
+    from halucinator.peripheral_models.falcon_ctxctl import (
+        MTHD_BIND_POINTER, MTHD_WFI_GOLDEN_SAVE, BIND_DONE, BIND_ERROR,
+        GOLDEN_DONE, GOLDEN_ERROR)
+
+    defaults = _nouveau_register_defaults()
+    assert sum(1 for v in defaults.values() if v) > 500, (
+        f"only {len(defaults)} defaults parsed -- the tables did not parse")
+
+    be, eng, _ = _boot(bar0=defaults)
+    assert eng.fecs_call(be, MTHD_BIND_POINTER, 0x00ABCD, clear=0x30,
+                         until=BIND_DONE | BIND_ERROR) & BIND_DONE
+    assert eng.fecs_call(be, MTHD_WFI_GOLDEN_SAVE, 0x00ABCD, clear=0x3,
+                         until=GOLDEN_DONE | GOLDEN_ERROR) & GOLDEN_DONE
+
+    expected = [eng.bar0_read(addr + i * 4)
+                for addr, count in eng.mmctx_runs for i in range(count)]
+    assert eng.mmctx_image == expected, "the image is not the register file"
+    live = [w for w in eng.mmctx_image if w]
+    assert len(live) >= 40, (
+        f"only {len(live)} of {len(eng.mmctx_image)} saved words are non-zero; "
+        "the register file was not read")
+    assert len(set(live)) >= 20, (
+        f"only {len(set(live))} distinct values -- a constant would pass a "
+        "count check")
+    assert be._step_fault_pc is None
