@@ -88,7 +88,13 @@ class MemoryRegion:
         qemu_properties: Optional[List[Dict]] = None,
         read_hook: Optional[Callable] = None,
         write_hook: Optional[Callable] = None,
+        space: Optional[str] = None,
     ):
+        # Ghidra address space this region lives in. Harvard targets (Falcon,
+        # AVR, 8051) put code, data and I/O in *separate* Sleigh spaces, and a
+        # region mapped into the default space is invisible to the loads and
+        # stores the language directs elsewhere. None = the language default.
+        self.space = space
         self.name = name
         self.base_addr = base_addr
         self.size = size
@@ -106,6 +112,13 @@ class MemoryRegion:
 # ---------------------------------------------------------------------------
 
 class HalBackend(ABC):
+    # Whether this backend keeps a region's `space` separate. Harvard targets
+    # (Falcon, AVR, 8051) put code, data and I/O in different address spaces,
+    # and a backend that flattens them will read zeros where the guest expects
+    # data, with no error. Only the Ghidra backend models them today, so the
+    # capability is declared rather than assumed.
+    supports_address_spaces = False
+
     """
     Abstract base class for all HALucinator emulator backends.
 
@@ -930,6 +943,46 @@ class M68KHalMixin(_ABIBase):
         self.write_registers(regs)
         self.cont()
 
+
+class FalconHalMixin:
+    """NVIDIA Falcon ABI.
+
+    Derived from the microcode's own conventions: the register-access helper
+    in GP102 FECS takes its arguments in $r10..$r13 and returns the value in
+    $r10, and `call` pushes the return address onto the stack that `ret` pops.
+    """
+
+    _ARG_REGS = ("r10", "r11", "r12", "r13")
+
+    def get_arg(self, idx: int) -> int:
+        if idx < len(self._ARG_REGS):
+            return self.read_register(self._ARG_REGS[idx])
+        # further arguments are on the stack, above the return address
+        sp = self.read_register("sp")
+        return self.read_memory(sp + 4 * (idx - len(self._ARG_REGS) + 1), 4, 1)
+
+    def set_args(self, args) -> None:
+        for i, val in enumerate(args):
+            if i < len(self._ARG_REGS):
+                self.write_register(self._ARG_REGS[i], val)
+
+    def get_ret_addr(self) -> int:
+        return self.read_memory(self.read_register("sp"), 4, 1)
+
+    def set_ret_addr(self, ret_addr: int) -> None:
+        self.write_memory(self.read_register("sp"), 4, ret_addr)
+
+    def execute_return(self, ret_value: int) -> None:
+        # Emulate `ret`: pop the return address and jump to it.
+        sp = self.read_register("sp")
+        ret_addr = self.read_memory(sp, 4, 1)
+        regs = {"sp": sp + 4, "pc": ret_addr}
+        if ret_value is not None:
+            regs["r10"] = ret_value & 0xFFFFFFFF
+        self.write_registers(regs)
+        self.cont()
+
+
 ABI_MIXINS: Dict[str, type] = {
     "cortex-m3": ARM32HalMixin,
     "arm":       ARM32HalMixin,
@@ -954,4 +1007,10 @@ ABI_MIXINS: Dict[str, type] = {
     # 'r0'", because r0 is not in the SPARC register map.
     "sparc":     SPARCHalMixin,
     "m68k":      M68KHalMixin,
+    # Falcon args live in r10..r13 and the return value in r10; without an
+    # entry here _bind_abi falls back to ARM32HalMixin *silently* and the
+    # first intercept dies on "Unknown register: 'r0'" -- Falcon has r0 but
+    # it is not the first argument.
+    "falcon":       FalconHalMixin,
+    "falcon-fuc4":  FalconHalMixin,
 }

@@ -1027,6 +1027,25 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                     pc = uc.reg_read(self._reg_map.get("pc"))
                     lr_reg = self._reg_map.get("lr")
                     lr = uc.reg_read(lr_reg) if lr_reg else 0
+                    # UNICORN TRAP (2026-08-28): on UC_HOOK_MEM_READ the
+                    # callback's `value` argument is ALWAYS 0 -- it carries the
+                    # datum only on UC_HOOK_MEM_READ_AFTER, which unicorn
+                    # 2.1.4's Python binding leaves COMMENTED OUT of hook_add's
+                    # handler map, so registering it raises UC_ERR_ARG whether
+                    # it is passed alone or OR-ed with UC_HOOK_MEM_READ.
+                    # Measured on this build: 80/80 reads over a flash window
+                    # holding 20 distinct values (19 non-zero, incl. the initial
+                    # SP 0x2000af30) were all reported `value=0x0`.  Believing
+                    # the argument reports "this address reads as zero" for any
+                    # address you point it at, which on device-moxa-nport-
+                    # express fabricated a whole finding.  The hook fires
+                    # BEFORE the load samples memory, so mem_read() here
+                    # returns exactly the datum the guest is about to take.
+                    try:
+                        value = int.from_bytes(uc.mem_read(addr, size),
+                                               "little")
+                    except Exception:  # noqa: BLE001
+                        value = -1
                     self._read_uninit[addr] = (pc, lr, size, value)
                     log.error("UNINIT-READ: 0x%08x (size %d, value=0x%x) "
                               "from PC=0x%08x lr=0x%08x",
@@ -3697,6 +3716,7 @@ class UnicornBackend(InProcessIrqMixin, ARMHalMixin, HalBackend):
                               begin=_ISEN0, end=_ISEN0 + 0x10 - 1)
             self._uc.hook_add(unicorn.UC_HOOK_MEM_WRITE, _icenabler_write,
                               begin=_ICEN0, end=_ICEN0 + 0x10 - 1)
+
     def _effective_vtor(self) -> int:
         """The vector base the firmware is actually using, if discoverable.
 

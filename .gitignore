@@ -102,3 +102,4 @@ run_renode.sh
 bpv5_*.log
 bpv5_*_screen.png
 bpv5_lcd_screen.png
+test/falcon_fecs/*.bin

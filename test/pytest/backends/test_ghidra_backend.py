@@ -73,15 +73,16 @@ def test_exc_return_magic_matches_arm_v7m():
     specifically thread-mode + MSP. inject_irq relies on these exact values
     so the emulator never needs to talk to a real NVIC model.
 
-    The mask is bits 31:5 (0xFFFFFFE0), not the top nibble: on an FPU part
+    The mask is bits 31:7 (0xFFFFFF80), not the top nibble: on an FPU part
     bit 4 carries "no floating-point context stacked", so an FP-context
-    return is 0xFFFFFFE1/E9/ED. Matching only 0xFFFFFFFx would fail to
-    recognise those and the ISR's `bx lr` would branch to an unmapped
-    address."""
+    return is 0xFFFFFFE1/E9/ED, and ARMv8-M adds bit 6 (S) and bit 5 (DCRS)
+    below those, so a non-secure thread return is 0xFFFFFFBC. Matching only
+    0xFFFFFFFx -- or only bits 31:5 -- would fail to recognise those and the
+    ISR's `bx lr` would branch to an unmapped address."""
     from halucinator.backends.ghidra_backend import GhidraBackend
     assert GhidraBackend._EXC_RETURN_THREAD_MSP == 0xFFFFFFF9
-    assert GhidraBackend._EXC_RETURN_MASK == 0xFFFFFFE0
-    assert GhidraBackend._EXC_RETURN_MAGIC == 0xFFFFFFE0
+    assert GhidraBackend._EXC_RETURN_MASK == 0xFFFFFF80
+    assert GhidraBackend._EXC_RETURN_MAGIC == 0xFFFFFF80
     # Sanity-check the mask-match logic — non-FP frames...
     assert (0xFFFFFFF9 & GhidraBackend._EXC_RETURN_MASK) == \
            GhidraBackend._EXC_RETURN_MAGIC
@@ -91,6 +92,9 @@ def test_exc_return_magic_matches_arm_v7m():
     assert (0xFFFFFFE9 & GhidraBackend._EXC_RETURN_MASK) == \
            GhidraBackend._EXC_RETURN_MAGIC
     assert (0xFFFFFFED & GhidraBackend._EXC_RETURN_MASK) == \
+           GhidraBackend._EXC_RETURN_MAGIC
+    # ...and ARMv8-M non-secure returns, which a bits-31:5 window missed.
+    assert (0xFFFFFFBC & GhidraBackend._EXC_RETURN_MASK) == \
            GhidraBackend._EXC_RETURN_MAGIC
     # A normal code address must NOT match
     assert (0x08001234 & GhidraBackend._EXC_RETURN_MASK) != \
@@ -210,3 +214,69 @@ def test_live_snapshot_restore(tmp_path):
         assert b.read_register("r0") == 0x1234
     finally:
         b.shutdown()
+
+
+def test_a_region_naming_a_missing_file_is_refused():
+    """Zeros are not firmware, and a zeroed image *executes*.
+
+    The loader used to fall through to an uninitialised block whenever a named
+    file was absent, so a typo in a path produced a guest full of zeros. That
+    runs: it decodes for a while, produces plausible-looking numbers and stops
+    somewhere arbitrary, which is indistinguishable from firmware that needs
+    more steps. It cost a wrong conclusion about a chip whose microcode simply
+    lives at a different path.
+
+    A region with no `file` at all is a different thing and still legitimate --
+    that is how RAM and MMIO windows are declared.
+    """
+    import pytest
+
+    pytest.importorskip("pyghidra")
+    import os
+    if not os.environ.get("GHIDRA_INSTALL_DIR"):
+        pytest.skip("GHIDRA_INSTALL_DIR not set")
+
+    from halucinator.backends.ghidra_backend import GhidraBackend
+    from halucinator.backends.hal_backend import MemoryRegion
+
+    be = GhidraBackend(arch="falcon", cpu_model="fuc5")
+    be.add_memory_region(MemoryRegion("imem", 0x0, 0x1000, permissions="rwx",
+                                      file="/nonexistent/firmware.bin"))
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        be.init()
+
+
+def test_an_image_larger_than_its_region_is_reported():
+    """The other half of the same trap.
+
+    `read(region.size)` drops the tail of an oversized image and the guest runs
+    into whatever follows it. That is recorded on the backend as well as logged,
+    because a log line is too easy to miss -- a test can assert
+    `truncated_regions` is empty, which a warning alone does not allow.
+    """
+    import os
+
+    import pytest
+
+    pytest.importorskip("pyghidra")
+    if not os.environ.get("GHIDRA_INSTALL_DIR"):
+        pytest.skip("GHIDRA_INSTALL_DIR not set")
+
+    from halucinator.backends.ghidra_backend import GhidraBackend
+    from halucinator.backends.hal_backend import MemoryRegion
+
+    big = b"\x00" * 0x2000
+    path = os.path.join(os.environ.get("TMPDIR", "/tmp"), "_hal_oversize.bin")
+    with open(path, "wb") as fh:
+        fh.write(big)
+    try:
+        be = GhidraBackend(arch="falcon", cpu_model="fuc5")
+        be.add_memory_region(MemoryRegion("imem", 0x0, 0x1000,
+                                          permissions="rwx", file=path))
+        assert be.truncated_regions == []
+        be.init()
+        assert be.truncated_regions, "an oversized image was dropped silently"
+        name, _p, whole, size = be.truncated_regions[0]
+        assert (name, whole, size) == ("imem", 0x2000, 0x1000)
+    finally:
+        os.unlink(path)
