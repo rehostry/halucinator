@@ -73,6 +73,19 @@ CTRL_ADDR_MASK = 0x03FFFFFC
 CTRL_OP_SHIFT, CTRL_OP_MASK = 29, 0x3
 OP_READ, OP_WRITE_A, OP_WRITE_B = 0, 2, 3
 
+# A two-bit status field in the same register, at bits 27-28. Turing's FECS
+# polls it where Pascal's waits on SIGNAL bit 6 for a read to land:
+#
+#   GP102 0x51f:  iord MMIO_CTRL; shr 0x1f; loop while bit31   then SIGNAL bit 6
+#   TU104 0x875:  iord MMIO_CTRL; extr 0x1b:0x1c; loop until it reads 2
+#
+# So the read-complete indication moved into the control register between the
+# two generations. 2 is what the firmware requires, not a code from any
+# documentation -- upstream does not describe this field at all. Reporting it
+# unconditionally is safe for Pascal, whose microcode never reads these bits.
+CTRL_STATUS_SHIFT, CTRL_STATUS_MASK = 27, 0x3
+CTRL_STATUS_DONE = 2
+
 # SIGNAL (CC 0x10000) bits the firmware waits on. Names from rnndb ctxctl.xml.
 SIGNAL_MMIO_RD_DONE = 1 << 6
 SIGNAL_MMIO_WRS_DONE = 1 << 7
@@ -515,7 +528,9 @@ class FalconCtxctl(FalconEngine):
         # by the time the firmware polls it. Hardware would clear it a little
         # later; a firmware that depended on observing GO *set* would spin,
         # and none does -- every site polls for it to clear.
-        self._ctrl = ctrl & ~CTRL_GO
+        self._ctrl = ((ctrl & ~CTRL_GO
+                       & ~(CTRL_STATUS_MASK << CTRL_STATUS_SHIFT))
+                      | (CTRL_STATUS_DONE << CTRL_STATUS_SHIFT))
 
     def level_source(self, line: int):
         """The method-FIFO line's source is "the FIFO is not empty".

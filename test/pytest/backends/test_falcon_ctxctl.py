@@ -37,6 +37,33 @@ def _fecs():
     pytest.skip("no FECS microcode under FALCON_FIRMWARE_DIR")
 
 
+# The generations this model is claimed to carry, one chip each. A full
+# linux-firmware tree has eighteen chips with FECS microcode and booting all of
+# them would take hours; more to the point, the claim is not that every chip
+# works. Ampere and later use a Falcon variant the processor module does not
+# cover (envydis cannot decode their SEC2 either), so including them would fail
+# for a reason that has nothing to do with the engine model.
+#
+# Add a chip here when it has been checked, not in the hope that it works.
+FECS_CHIPS = ("gp102", "gp104", "tu104")
+
+
+def _all_fecs():
+    """The FECS image pairs for FECS_CHIPS that are present."""
+    root = os.environ.get(FW_ENV)
+    if not root:
+        pytest.skip(f"set {FW_ENV} to a linux-firmware nvidia/ tree")
+    found = []
+    for name in FECS_CHIPS:
+        inst = pathlib.Path(root) / name / "gr" / "fecs_inst.bin"
+        data = inst.with_name("fecs_data.bin")
+        if inst.is_file() and data.is_file():
+            found.append((name, inst, data))
+    if not found:
+        pytest.skip(f"none of {FECS_CHIPS} found under {root}")
+    return found
+
+
 def _gpccs():
     """The GPCCS code and data images -- the per-GPC context controller."""
     root = os.environ.get(FW_ENV)
@@ -61,7 +88,12 @@ def _boot(steps=150_000, images=None, **engine_kwargs):
         pytest.skip("GHIDRA_INSTALL_DIR not set")
     eng = FalconCtxctl("ctxctl", 0x0, 0x40000, **engine_kwargs)
     be = GhidraBackend(arch="falcon", cpu_model="fuc5")
-    be.add_memory_region(MemoryRegion("imem", 0x0, 0x8000,
+    # Size IMEM from the image, never from a constant that happens to fit the
+    # chip this was written against. GP102's code is 0x51bf bytes and TU104's is
+    # 0x7198, so a fixed 0x8000 is already within one generation of truncating
+    # silently -- and a truncated image executes zeros rather than failing.
+    imem = max(0x8000, (inst.stat().st_size + 0xFFF) & ~0xFFF)
+    be.add_memory_region(MemoryRegion("imem", 0x0, imem,
                                       permissions="rwx", file=str(inst)))
     be.add_memory_region(MemoryRegion("dmem", 0x0, 0x4000,
                                       permissions="rw", space="dmem",
@@ -992,3 +1024,58 @@ def test_the_saved_image_carries_the_values_the_registers_held():
         f"only {len(set(live))} distinct values -- a constant would pass a "
         "count check")
     assert be._step_fault_pc is None
+
+
+# ---------------------------------------------------------------------------
+# More than one chip, and more than one generation.
+# ---------------------------------------------------------------------------
+
+def test_every_available_chip_answers_the_control_methods():
+    """The model, not the image.
+
+    Pascal and Turing FECS differ: different code, different interrupt
+    enables, different vectors, and -- as it turns out -- a different place to
+    report that an MMIO-bus read has landed. Pascal waits on SIGNAL bit 6;
+    Turing polls a two-bit status field in MMIO_CTRL itself, which is why it
+    used to boot and then never report ready.
+
+    Each chip here must reach ready, answer all three size queries, bind an
+    instance pointer and complete a golden-context save. The sizes are not
+    compared against fixed numbers, because they are properties of the chip --
+    what is asserted is that they are answered, distinct from each other, and
+    that the golden save moved registers.
+    """
+    from halucinator.peripheral_models.falcon_ctxctl import (
+        MTHD_DISCOVER_IMAGE_SIZE, MTHD_DISCOVER_ZCULL_IMAGE_SIZE,
+        MTHD_DISCOVER_PM_IMAGE_SIZE, MTHD_BIND_POINTER, MTHD_WFI_GOLDEN_SAVE,
+        BIND_DONE, BIND_ERROR, GOLDEN_DONE, GOLDEN_ERROR)
+
+    chips = _all_fecs()
+    results = {}
+    for name, inst, data in chips:
+        be, eng, _ = _boot(images=(inst, data))
+        assert be._step_fault_pc is None, f"{name}: wedged"
+        assert eng.scratch0, f"{name}: never reported ready"
+        sizes = tuple(eng.fecs_call(be, m, 0) for m in
+                      (MTHD_DISCOVER_IMAGE_SIZE,
+                       MTHD_DISCOVER_ZCULL_IMAGE_SIZE,
+                       MTHD_DISCOVER_PM_IMAGE_SIZE))
+        assert all(sizes), f"{name}: a size query went unanswered -- {sizes}"
+        assert len(set(sizes)) == 3, f"{name}: sizes not distinct -- {sizes}"
+        assert eng.fecs_call(be, MTHD_BIND_POINTER, 0x00ABCD, clear=0x30,
+                             until=BIND_DONE | BIND_ERROR) & BIND_DONE, \
+            f"{name}: bind_pointer did not report done"
+        assert eng.fecs_call(be, MTHD_WFI_GOLDEN_SAVE, 0x00ABCD, clear=0x3,
+                             until=GOLDEN_DONE | GOLDEN_ERROR) & GOLDEN_DONE, \
+            f"{name}: golden save did not report done"
+        assert eng.mmctx_saved > 100, (
+            f"{name}: only {eng.mmctx_saved} registers saved")
+        results[name] = sizes + (eng.mmctx_saved, len(eng.mmctx_runs))
+        assert be._step_fault_pc is None, f"{name}: wedged after the methods"
+
+    # Different generations must not report the same numbers. If they did, the
+    # answers would be coming from this model rather than from the microcode.
+    families = {n[:2] for n in results}
+    if len(families) > 1:
+        assert len(set(results.values())) > 1, (
+            f"every chip answered identically across generations: {results}")
