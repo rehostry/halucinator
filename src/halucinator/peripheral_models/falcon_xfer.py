@@ -43,6 +43,13 @@ class FalconXferEngine:
         # TLB[i] = (virt_page_index, flags) for physical code page i
         self.tlb: List[List[int]] = [[0, 0] for _ in range(code_pages)]
         self.loads = self.stores = self.code_loads = 0
+        # Every transfer's external address, in order, as (kind, port, addr,
+        # length). The counters say a transfer happened; this says *where*,
+        # which is what lets a caller check that a context save or load went
+        # to the image belonging to the channel it was asked about. Bounded so
+        # a long run cannot grow it without limit.
+        self.transfers: List[tuple] = []
+        self.max_transfers = 4096
 
     # -- external memory ---------------------------------------------------
 
@@ -77,6 +84,10 @@ class FalconXferEngine:
 
     # -- transfers ---------------------------------------------------------
 
+    def _record(self, kind: str, port: int, addr: int, length: int) -> None:
+        if len(self.transfers) < self.max_transfers:
+            self.transfers.append((kind, port, addr, length))
+
     @staticmethod
     def _data_len(size: int) -> int:
         """xfer.rst: a data xfer copies (4 << size) bytes, size 0-6."""
@@ -91,6 +102,7 @@ class FalconXferEngine:
         backend.write_memory(local & 0xFFFF, 1, data, len(data), raw=True,
                              space="dmem")
         self.loads += 1
+        self._record("load", port, addr, length)
         log.info("FalconXfer: data load port%d 0x%x -> D[0x%x] (%d bytes)",
                  port, addr, local & 0xFFFF, length)
         return length
@@ -104,6 +116,7 @@ class FalconXferEngine:
                                    space="dmem")
         self._write_ext(port, addr, bytes(data))
         self.stores += 1
+        self._record("store", port, addr, length)
         log.info("FalconXfer: data store D[0x%x] -> port%d 0x%x (%d bytes)",
                  local & 0xFFFF, port, addr, length)
         return length
@@ -126,6 +139,7 @@ class FalconXferEngine:
             self.tlb[phys] = [(ext_off >> 8) & self.vm_page_mask,
                               FLAG_SECRET if secret else FLAG_USABLE]
         self.code_loads += 1
+        self._record("code", port, addr, 0x100)
         log.info("FalconXfer: code load port%d 0x%x -> IMEM page %d "
                  "(virt 0x%x)%s", port, addr, phys, (ext_off >> 8) & 0xFFFF,
                  " secret" if secret else "")

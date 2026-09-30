@@ -284,7 +284,7 @@ def test_config_regions_keep_their_space_and_peripheral():
 
     from halucinator.hal_config import HalucinatorConfig
     from halucinator.main import memory_region_from_config
-    from halucinator.peripheral_models.falcon_engine import FalconEngine
+    from halucinator.peripheral_models.falcon_ctxctl import FalconCtxctl
 
     cfg_path = (pathlib.Path(__file__).resolve().parents[1]
                 / "falcon_fecs" / "falcon_fecs.yaml")
@@ -297,5 +297,9 @@ def test_config_regions_keep_their_space_and_peripheral():
     assert regions["dmem"].space == "dmem"
     assert regions["io"].space == "io"
     assert regions["imem"].space is None
-    assert regions["io"].emulate is FalconEngine
+    assert regions["io"].emulate is FalconCtxctl
     assert regions["dmem"].emulate is None
+    # Both firmware halves have to reach the guest; the data image is what the
+    # microcode's init reads its tables from.
+    assert regions["imem"].file.endswith("fecs_inst.bin")
+    assert regions["dmem"].file.endswith("fecs_data.bin")

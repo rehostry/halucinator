@@ -135,15 +135,125 @@ METHOD_IRQ_LINE = 2
 # MISC range (0x20000) is the scratch/mailbox block -- BAR0 0x409800 upwards.
 # It is the biggest single block of registers the firmware touches, and being
 # "misc/unknown stuff" upstream is why that was not obvious.
-SCRATCH0 = 0x20000
-SCRATCH1 = 0x20100
+# Eight scratch registers with the usual set/clear aliases (intro.rst lists
+# SCRATCH, SCRATCH_SET and SCRATCH_CLEAR as three consecutive banks from BAR0
+# 0x800). The driver uses more than the first one: nouveau writes BAR0 0x409810
+# -- SCRATCH[4] -- to hand an instance pointer to methods 0x31 and 0x32, and
+# the firmware reports an error code in SCRATCH[6].
+#
+# The aliases are taken on the documentation's word, and that is worth stating
+# plainly. GP102 FECS uses a *second* pair in the same shape -- it writes a bit
+# to 0x23200 on entering a routine and the same bit to 0x21200 on leaving it --
+# and 0x21200 is inside the bank intro.rst calls SCRATCH_CLEAR, which would make
+# the matching set register 0x20a00 rather than 0x23200. Nothing in the image
+# ever reads any of these back, so no rehost observation can decide between the
+# two readings; it follows the documented one. What depends on the choice is
+# only what a host watching the scratch bank would see, and the registers the
+# driver actually reads -- SCRATCH[0] for replies, SCRATCH[4] for parameters --
+# are written directly and are unaffected either way.
+N_SCRATCH = 8
+SCRATCH = 0x20000                # BAR0 0x800 + i*4
+SCRATCH_SET = 0x20800            # BAR0 0x820 + i*4
+SCRATCH_CLEAR = 0x21000          # BAR0 0x840 + i*4
+
+SCRATCH0 = SCRATCH
+SCRATCH1 = SCRATCH + 0x100
+
+# The firmware reports why it refused a method here, and raises the upstream
+# interrupt. 0x11 is "method not recognised" -- its dispatcher's default case
+# at 0x4e6a writes exactly that before signalling.
+SCRATCH_ERROR = 6
+ERR_UNKNOWN_METHOD = 0x11
+INTR_UP_SET = 0x30700
 
 # FECS methods, from the driver that issues them.
-MTHD_DISCOVER_IMAGE_SIZE = 0x10
-MTHD_DISCOVER_ZCULL_IMAGE_SIZE = 0x16
-MTHD_SET_WATCHDOG_TIMEOUT = 0x21
-MTHD_DISCOVER_PM_IMAGE_SIZE = 0x25
-MTHD_DISCOVER_REGLIST_IMAGE_SIZE = 0x30
+# FECS control methods, named after the nouveau helper that issues each one
+# (nvkm/engine/gr/gf100.c). The handler each lands in is from the dispatch
+# table at 0x4b80 in the GP102 image.
+MTHD_BIND_POINTER = 0x03                 # -> 0x4d54
+MTHD_WFI_GOLDEN_SAVE = 0x09              # -> 0x4d2e
+MTHD_DISCOVER_IMAGE_SIZE = 0x10          # -> 0x4d89 -> 0x2876
+MTHD_DISCOVER_ZCULL_IMAGE_SIZE = 0x16    # -> 0x4da1 -> 0x255d
+MTHD_SET_WATCHDOG_TIMEOUT = 0x21         # -> 0x4d06
+MTHD_DISCOVER_PM_IMAGE_SIZE = 0x25       # -> 0x4dab -> 0x1e23
+MTHD_DISCOVER_REGLIST_IMAGE_SIZE = 0x30  # -> 0x4e28 -> 0x47d5
+MTHD_SET_REGLIST_BIND_INSTANCE = 0x31    # -> 0x4e32
+MTHD_SET_REGLIST_VIRTUAL_ADDRESS = 0x32  # -> 0x4e48
+
+# The scratch register nouveau hands an instance pointer through, for the two
+# reglist methods: BAR0 0x409810, which is SCRATCH[4].
+SCRATCH_INSTANCE = 4
+
+# Reply bits, from the driver's own poll conditions. bind_pointer masks 0x30
+# and then waits for 0x10 (done) or 0x20 (error); wfi_golden_save masks 0x3 and
+# waits for 0x1 or 0x2. The discover_* methods instead put a whole value in
+# SCRATCH[0] and any non-zero read is the answer.
+BIND_DONE, BIND_ERROR = 0x10, 0x20
+GOLDEN_DONE, GOLDEN_ERROR = 0x01, 0x02
+
+# MMCTX: the engine that moves the MMIO half of a context image. Names and
+# fields from rnndb graph/gf100_pgraph/ctxctl.xml (BAR0 0x700-0x74c).
+#
+# The firmware drives it as a queue. It writes MMCTX_CTRL with START_TRIGGER and
+# a queue limit, then pushes descriptors into MMCTX_QUEUE for as long as
+# MMCTX_CTRL.QFREE says there is room, then writes STOP_TRIGGER and waits for
+# that bit to clear. Each descriptor names a run of consecutive BAR0 registers;
+# the engine copies that run to or from the image, and DIR says which way.
+#
+# QFREE reading zero is what used to stall this: with no queue modelled the
+# firmware waited for room forever, and the golden-context save never finished.
+MMCTX_BASE = 0x1C400             # BAR0 0x710
+MMCTX_CTRL = 0x1C500             # BAR0 0x714
+MMCTX_MULTI_STRIDE = 0x1C600     # BAR0 0x718
+MMCTX_MULTI_MASK = 0x1C700       # BAR0 0x71c
+MMCTX_QUEUE = 0x1C800            # BAR0 0x720
+MMCTX_LOAD_COUNT = 0x1D300       # BAR0 0x74c
+
+MMCTX_QFREE = 0x0000001F
+MMCTX_QLIMIT_SHIFT, MMCTX_QLIMIT_MASK = 8, 0x1F
+MMCTX_DIR = 1 << 16             # 0 save, 1 load
+MMCTX_START_TRIGGER = 1 << 17
+MMCTX_STOP_TRIGGER = 1 << 18
+
+# MMCTX_QUEUE descriptor fields.
+Q_BASE_EN = 1 << 0
+Q_MULTI_EN = 1 << 1
+Q_ADDR_SHIFT, Q_ADDR_MASK = 2, 0x00FFFFFF
+Q_CNTM1_SHIFT, Q_CNTM1_MASK = 26, 0x3F
+
+# STRAND range (0x24000) plus the two strand registers that live in MISC.
+# Names and offsets from rnndb graph/gf100_pgraph/ctxctl.xml; falcon IO address
+# is the BAR0 offset times 0x40, and an indexed register's strand number adds
+# index*4 on top of that.
+#
+# A strand is one serial chain of context state. The firmware sizes the context
+# image by walking the nine STRAND_WORDS registers (its loop at 0xa4a runs
+# 0x24400..0x24420 inclusive, which is what fixes the count at nine), giving
+# each non-empty strand a save and load base in the image as it goes.
+STRANDS_CNT = 0x22000            # BAR0 0x880
+STRANDS_CMD_MASK = 0x22100       # BAR0 0x884
+STRAND_SAVE_SWBASE = 0x24200     # BAR0 0x908, per strand
+STRAND_LOAD_SWBASE = 0x24300     # BAR0 0x90c, per strand
+STRAND_WORDS = 0x24400           # BAR0 0x910, per strand
+STRAND_DATA = 0x24600            # BAR0 0x918
+STRAND_SELECT = 0x24700          # BAR0 0x91c
+STRAND_STATUS = 0x24900          # BAR0 0x924
+STRAND_CMD = 0x24A00             # BAR0 0x928
+STRAND_FILTER = 0x24F00          # BAR0 0x93c
+
+N_STRANDS = 9
+
+# Index 0x3f addresses every strand at once. The firmware only ever uses the
+# broadcast form for commands -- `mov $r9 0x24afc` is STRAND_CMD index 0x3f --
+# which is why the command registers appear at a +0xfc offset throughout.
+STRAND_BROADCAST = 0xFC
+
+# STRAND_CMD values (rnndb). The firmware issues ENABLE/ACTIVATE_FILTER around
+# each walk and DISABLE at the end; GP102 also uses 0x11, which upstream does
+# not name.
+STRAND_CMD_SEEK, STRAND_CMD_GET_INFO = 1, 2
+STRAND_CMD_SAVE, STRAND_CMD_LOAD = 3, 4
+STRAND_CMD_ENABLE, STRAND_CMD_DISABLE = 0xC, 0xD
 
 # MEMIF range (0x28000): the memory interface the context save and restore run
 # through. Names from rnndb ctxctl.xml.
@@ -171,7 +281,8 @@ class FalconCtxctl(FalconEngine):
     """A Falcon engine plus the CTXCTL MMIO bus and a GPU register file."""
 
     def __init__(self, name: str, address: int, size: int,
-                 bar0: Optional[Dict[int, int]] = None, **kwargs: Any) -> None:
+                 bar0: Optional[Dict[int, int]] = None,
+                 strand_words: Optional[list] = None, **kwargs: Any) -> None:
         super().__init__(name, address, size, **kwargs)
         # The GPU's BAR0 register space as the firmware sees it through the
         # MMIO bus. Not the falcon's own IO window -- a different space
@@ -208,27 +319,127 @@ class FalconCtxctl(FalconEngine):
         self.mem_commands = []
         self.wrcmd_data = 0
         self.wrcmd_cmd = 0
-        self.scratch0 = 0
-        self.scratch1 = 0
+        self.scratch = [0] * N_SCRATCH
         self.methods = []
         self._fifo = []
+        # Strand state. STRAND_WORDS is an input to this model, not an output
+        # of it: on hardware the strand unit reports how much state each chain
+        # holds, and nothing in a rehost can derive that. Zero for every strand
+        # is the honest default -- it says "no context state is modelled" --
+        # and a caller with measured values passes them in. What the model does
+        # guarantee is that the firmware's own arithmetic runs over whatever it
+        # is given, so the size FECS reports moves with these numbers.
+        self.strand_words = list(strand_words or [0] * N_STRANDS)[:N_STRANDS]
+        self.strand_words += [0] * (N_STRANDS - len(self.strand_words))
+        self.strand_save_base = [0] * N_STRANDS
+        self.strand_load_base = [0] * N_STRANDS
+        self.strand_cmds = []
+        self.strand_select = 0
+        self.strand_filter = 0
+        self.strand_data = 0
+        # MMCTX. `mmctx_image` stands in for the memory the engine would reach
+        # through MEMIF: a save appends register values to it and a load reads
+        # them back, so a save followed by a load is a round trip that can be
+        # checked. `mmctx_runs` records the register ranges each descriptor
+        # named, which is the firmware's own register list made observable.
+        self.mmctx_base = 0
+        self.mmctx_multi_stride = 0
+        self.mmctx_multi_mask = 0
+        self.mmctx_load_count = 0
+        self.mmctx_qlimit = 0
+        self.mmctx_dir = 0
+        self.mmctx_running = False
+        self.mmctx_image = []
+        self.mmctx_cursor = 0
+        self.mmctx_runs = []
+        self.mmctx_saved = 0
+        self.mmctx_loaded = 0
 
-    def fecs_method(self, method: int, arg: int = 0) -> None:
+    # -- the scratch bank, as the driver sees it ---------------------------
+    #
+    # SCRATCH[0] is the reply register for every FECS control method, so it is
+    # worth naming. The rest are parameters and status.
+
+    @property
+    def scratch0(self) -> int:
+        return self.scratch[0]
+
+    @scratch0.setter
+    def scratch0(self, value: int) -> None:
+        self.scratch[0] = value & 0xFFFFFFFF
+
+    @property
+    def scratch1(self) -> int:
+        return self.scratch[1]
+
+    @scratch1.setter
+    def scratch1(self, value: int) -> None:
+        self.scratch[1] = value & 0xFFFFFFFF
+
+    def mask_scratch(self, index: int, mask: int, value: int = 0) -> None:
+        """`nvkm_mask` on one scratch register, which is how nouveau clears it.
+
+        Two of the methods clear only their own reply bits rather than the whole
+        register -- bind_pointer masks 0x30, wfi_golden_save masks 0x3 -- so a
+        blanket zero would be a different operation from the one the driver
+        performs.
+        """
+        cur = self.scratch[index] & ~(mask & 0xFFFFFFFF)
+        self.scratch[index] = (cur | (value & mask)) & 0xFFFFFFFF
+
+    def fecs_method(self, method: int, arg: int = 0,
+                    clear: Optional[int] = 0xFFFFFFFF) -> None:
         """Issue a FECS method the way the host driver does.
 
-        Nouveau clears the scratch register, writes the argument, then writes
-        the method -- and the write of the method is what sets the microcode
-        going. The answer comes back in the same scratch register, which is
-        why it is cleared first: a non-zero read is how the driver knows the
-        reply has arrived.
+        Nouveau clears the reply register, writes the argument to BAR0 0x409500
+        and then the method to 0x409504 -- and the write of the method is what
+        sets the microcode going. The answer comes back in SCRATCH[0], which is
+        why it is cleared first: the driver is polling that register and only a
+        change tells it the reply has arrived.
+
+        `clear` is the mask cleared from SCRATCH[0] before submitting, because
+        the driver does not always clear the whole register (see mask_scratch).
+        Pass None to leave it untouched.
         """
-        self.scratch0 = 0
+        if clear:
+            self.mask_scratch(0, clear)
         self.wrcmd_data = arg & 0xFFFFFFFF
         self.wrcmd_cmd = method & 0xFFFFFFFF
         self.methods.append((method, arg))
         self._fifo.append((method & 0xFFFFFFFF, arg & 0xFFFFFFFF))
         self.raise_line(METHOD_IRQ_LINE)
         log.info("%s: FECS method 0x%02x arg 0x%08x", self.name, method, arg)
+
+    def fecs_call(self, backend, method: int, arg: int = 0,
+                  clear: Optional[int] = 0xFFFFFFFF,
+                  until: Optional[int] = None,
+                  steps: int = 200_000) -> int:
+        """Issue a method, let the microcode run, and return SCRATCH[0].
+
+        The driver-shaped call: submit and poll. It runs the guest because the
+        reply only exists once the firmware has produced it -- a rehost has no
+        other clock.
+
+        `until` is the bitmask that means "answered", matching what the driver
+        polls for: the discover_* methods put a whole value in SCRATCH[0] and
+        treat any non-zero read as the reply, which is the default, while
+        bind_pointer and wfi_golden_save watch particular bits. Getting this
+        wrong the other way is a real hazard -- SCRATCH[0] already has the ready
+        bit set, so "non-zero" would look answered before the method ran at all.
+
+        Returns SCRATCH[0] when the condition is met, the guest stops, or the
+        budget runs out; a method that does not reply simply spends the budget.
+        """
+        mask = 0xFFFFFFFF if until is None else until
+        self.fecs_method(method, arg, clear=clear)
+        for _ in range(steps):
+            backend.step()
+            if getattr(backend, "_halted", False) or \
+                    getattr(backend, "_step_fault_pc", None) is not None:
+                break
+            if not self._fifo and (self.scratch[0] & mask):
+                break                      # acknowledged and answered
+        return self.scratch[0]
 
     # -- the host side -----------------------------------------------------
 
@@ -301,15 +512,111 @@ class FalconCtxctl(FalconEngine):
         # and none does -- every site polls for it to clear.
         self._ctrl = ctrl & ~CTRL_GO
 
+    def level_source(self, line: int):
+        """The method-FIFO line's source is "the FIFO is not empty".
+
+        The firmware's own init writes INTR_MODE = 0x4, so line 2 -- and only
+        line 2 -- is level-triggered, and its handler at 0x2bb acknowledges by
+        writing FIFO_ACK, never INTR_CLEAR. Popping the entry is therefore what
+        deasserts the interrupt.
+        """
+        if line == METHOD_IRQ_LINE:
+            return bool(self._fifo)
+        return None
+
+    # -- MMCTX: the MMIO half of a context image --------------------------
+
+    def _mmctx_ctrl(self) -> int:
+        """MMCTX_CTRL as the firmware reads it back.
+
+        QFREE is the number of free queue slots. Nothing in this model takes
+        time, so a descriptor is consumed the moment it is written and the queue
+        is always empty -- QFREE therefore reads as the whole limit. Both
+        triggers read zero because both have already completed; the firmware
+        waits for STOP_TRIGGER to clear and would wait forever otherwise.
+        """
+        free = self.mmctx_qlimit & MMCTX_QFREE
+        return (free
+                | ((self.mmctx_qlimit & MMCTX_QLIMIT_MASK) << MMCTX_QLIMIT_SHIFT)
+                | (MMCTX_DIR if self.mmctx_dir else 0))
+
+    def _mmctx_write_ctrl(self, value: int) -> None:
+        self.mmctx_qlimit = (value >> MMCTX_QLIMIT_SHIFT) & MMCTX_QLIMIT_MASK
+        self.mmctx_dir = 1 if value & MMCTX_DIR else 0
+        if value & MMCTX_START_TRIGGER:
+            self.mmctx_running = True
+            self.mmctx_cursor = 0
+            self.mmctx_runs = []
+            if not self.mmctx_dir:
+                self.mmctx_image = []          # a save starts a fresh image
+            log.info("%s: MMCTX %s started, queue limit %d", self.name,
+                     "load" if self.mmctx_dir else "save", self.mmctx_qlimit)
+        if value & MMCTX_STOP_TRIGGER:
+            self.mmctx_running = False
+            log.info("%s: MMCTX %s done, %d registers, %d words in the image",
+                     self.name, "load" if self.mmctx_dir else "save",
+                     sum(n for _a, n in self.mmctx_runs), len(self.mmctx_image))
+
+    def _mmctx_queue(self, desc: int) -> None:
+        """Carry out one queue descriptor.
+
+        A descriptor names `CNTM1 + 1` consecutive BAR0 registers starting at
+        ADDR (which is stored shifted right by two), optionally offset by
+        MMCTX_BASE. With MULTI_EN the same run is repeated at MULTI_STRIDE
+        intervals, once per set bit in MULTI_MASK -- that is how one descriptor
+        covers the same registers in every GPC.
+        """
+        if not self.mmctx_running:
+            # Outside a START/STOP pair there is no transfer to contribute to.
+            # This guard is about the backend rather than the hardware: writes
+            # are delivered by comparing the guest's value against a shadow read
+            # back a step later, so a descriptor value still sitting in memory
+            # can be re-offered. Refusing it keeps a stale word from appending
+            # phantom registers to a finished image.
+            log.debug("%s: MMCTX descriptor 0x%08x outside a transfer, ignored",
+                      self.name, desc)
+            return
+        addr = ((desc >> Q_ADDR_SHIFT) & Q_ADDR_MASK) << 2
+        count = ((desc >> Q_CNTM1_SHIFT) & Q_CNTM1_MASK) + 1
+        if desc & Q_BASE_EN:
+            addr += self.mmctx_base
+        starts = [addr]
+        if desc & Q_MULTI_EN and self.mmctx_multi_mask:
+            starts = [addr + i * self.mmctx_multi_stride
+                      for i in range(self.mmctx_multi_mask.bit_length())
+                      if (self.mmctx_multi_mask >> i) & 1]
+        for start in starts:
+            self.mmctx_runs.append((start, count))
+            for i in range(count):
+                reg = start + i * 4
+                if self.mmctx_dir:
+                    if self.mmctx_cursor < len(self.mmctx_image):
+                        self.bar0_write(reg, self.mmctx_image[self.mmctx_cursor])
+                        self.mmctx_loaded += 1
+                    self.mmctx_cursor += 1
+                else:
+                    self.mmctx_image.append(self.bar0_read(reg))
+                    self.mmctx_saved += 1
+
     def live_registers(self):
         return tuple(super().live_registers()) + (
             MMIO_CTRL, MMIO_RDVAL, MMIO_WRVAL,
             MMCTX_SAVE_SWBASE, MMCTX_LOAD_SWBASE,
+            MMCTX_BASE, MMCTX_CTRL, MMCTX_MULTI_STRIDE, MMCTX_MULTI_MASK,
+            MMCTX_QUEUE, MMCTX_LOAD_COUNT,
             CURRENT_CTX, NEW_CTX, GRAPH_ENGINE_STATUS, ENGINE_TRIGGER,
             MEM_BASE, MEM_CHAN, MEM_CMD, MEM_TARGET,
-            WRCMD_DATA, WRCMD_CMD, SCRATCH0, SCRATCH1,
+            WRCMD_DATA, WRCMD_CMD,
             FIFO_DATA, FIFO_CMD, FIFO_OCCUPIED, FIFO_ACK,
-        )
+            STRANDS_CNT, STRAND_STATUS,
+            STRAND_CMD + STRAND_BROADCAST, STRAND_FILTER + STRAND_BROADCAST,
+            STRAND_SELECT + STRAND_BROADCAST, STRAND_DATA + STRAND_BROADCAST,
+        ) + tuple(SCRATCH + i * 0x100 for i in range(N_SCRATCH)) \
+          + tuple(SCRATCH_SET + i * 0x100 for i in range(N_SCRATCH)) \
+          + tuple(SCRATCH_CLEAR + i * 0x100 for i in range(N_SCRATCH)) \
+          + tuple(STRAND_WORDS + i * 4 for i in range(N_STRANDS)) \
+          + tuple(STRAND_SAVE_SWBASE + i * 4 for i in range(N_STRANDS)) \
+          + tuple(STRAND_LOAD_SWBASE + i * 4 for i in range(N_STRANDS))
 
     def hw_read(self, offset: int, size: int, pc: int = 0xBAADBAAD,
                 **kwargs: Any) -> int:
@@ -321,6 +628,18 @@ class FalconCtxctl(FalconEngine):
             return self._rdval
         if offset == MMIO_WRVAL:
             return self._wrval
+        if offset == MMCTX_CTRL:
+            return self._mmctx_ctrl()
+        if offset == MMCTX_BASE:
+            return self.mmctx_base
+        if offset == MMCTX_MULTI_STRIDE:
+            return self.mmctx_multi_stride
+        if offset == MMCTX_MULTI_MASK:
+            return self.mmctx_multi_mask
+        if offset == MMCTX_QUEUE:
+            return 0                         # write-only descriptor port
+        if offset == MMCTX_LOAD_COUNT:
+            return self.mmctx_load_count
         if offset == MMCTX_SAVE_SWBASE:
             return self.mmctx_save_base
         if offset == MMCTX_LOAD_SWBASE:
@@ -337,10 +656,18 @@ class FalconCtxctl(FalconEngine):
             return self.wrcmd_data
         if offset == WRCMD_CMD:
             return self.wrcmd_cmd
-        if offset == SCRATCH0:
-            return self.scratch0
-        if offset == SCRATCH1:
-            return self.scratch1
+        if SCRATCH <= offset < SCRATCH + N_SCRATCH * 0x100 and \
+                offset % 0x100 == 0:
+            return self.scratch[(offset - SCRATCH) // 0x100]
+        if (SCRATCH_SET <= offset < SCRATCH_SET + N_SCRATCH * 0x100
+                or SCRATCH_CLEAR <= offset < SCRATCH_CLEAR + N_SCRATCH * 0x100) \
+                and offset % 0x100 == 0:
+            # Write-only alias ports. Reading the merged value back through them
+            # would also make the backend's shadow miss a repeat: it delivers a
+            # write by noticing the guest's value differs from what it last
+            # read, so a port that reads back what was just written swallows the
+            # next identical write.
+            return 0
         if offset == MEM_BASE:
             return self.mem_base
         if offset == MEM_CHAN:
@@ -355,6 +682,18 @@ class FalconCtxctl(FalconEngine):
             return self.engine_status
         if offset == ENGINE_TRIGGER:
             return self.engine_trigger
+        if offset == STRANDS_CNT:
+            return N_STRANDS
+        if offset == STRAND_STATUS:
+            # LAST_CMD, bits 0:3. Nothing is ever busy in this model, so the
+            # status only has to report what was asked for last.
+            return (self.strand_cmds[-1] & 0xF) if self.strand_cmds else 0
+        if STRAND_WORDS <= offset < STRAND_WORDS + N_STRANDS * 4:
+            return self.strand_words[(offset - STRAND_WORDS) // 4] & 0xFFFFFFFF
+        if STRAND_SAVE_SWBASE <= offset < STRAND_SAVE_SWBASE + N_STRANDS * 4:
+            return self.strand_save_base[(offset - STRAND_SAVE_SWBASE) // 4]
+        if STRAND_LOAD_SWBASE <= offset < STRAND_LOAD_SWBASE + N_STRANDS * 4:
+            return self.strand_load_base[(offset - STRAND_LOAD_SWBASE) // 4]
         if offset in IO_DEFAULTS and offset not in self.registers:
             return IO_DEFAULTS[offset]
         return super().hw_read(offset, size, pc=pc, **kwargs)
@@ -369,6 +708,24 @@ class FalconCtxctl(FalconEngine):
             return True
         if offset == MMIO_RDVAL:
             return True                      # readback only
+        if offset == MMCTX_CTRL:
+            self._mmctx_write_ctrl(value & 0xFFFFFFFF)
+            return True
+        if offset == MMCTX_QUEUE:
+            self._mmctx_queue(value & 0xFFFFFFFF)
+            return True
+        if offset == MMCTX_BASE:
+            self.mmctx_base = value & 0xFFFFFFFF
+            return True
+        if offset == MMCTX_MULTI_STRIDE:
+            self.mmctx_multi_stride = value & 0xFFFFFFFF
+            return True
+        if offset == MMCTX_MULTI_MASK:
+            self.mmctx_multi_mask = value & 0xFFFFFFFF
+            return True
+        if offset == MMCTX_LOAD_COUNT:
+            self.mmctx_load_count = value & 0xFFFFFFFF
+            return True
         if offset == MMCTX_SAVE_SWBASE:
             self.mmctx_save_base = value & 0xFFFFFFFF
             return True
@@ -380,18 +737,46 @@ class FalconCtxctl(FalconEngine):
                 done = self._fifo.pop(0)
                 log.info("%s: method 0x%02x acknowledged", self.name, done[0])
             return True
+        if offset == STRAND_CMD + STRAND_BROADCAST:
+            self.strand_cmds.append(value & 0xFFFFFFFF)
+            return True
+        if offset == STRAND_FILTER + STRAND_BROADCAST:
+            self.strand_filter = value & 0xFFFFFFFF
+            return True
+        if offset == STRAND_SELECT + STRAND_BROADCAST:
+            self.strand_select = value & 0xFFFFFFFF
+            return True
+        if offset == STRAND_DATA + STRAND_BROADCAST:
+            self.strand_data = value & 0xFFFFFFFF
+            return True
+        if STRAND_SAVE_SWBASE <= offset < STRAND_SAVE_SWBASE + N_STRANDS * 4:
+            self.strand_save_base[(offset - STRAND_SAVE_SWBASE) // 4] = value & 0xFFFFFFFF
+            return True
+        if STRAND_LOAD_SWBASE <= offset < STRAND_LOAD_SWBASE + N_STRANDS * 4:
+            self.strand_load_base[(offset - STRAND_LOAD_SWBASE) // 4] = value & 0xFFFFFFFF
+            return True
+        if STRAND_WORDS <= offset < STRAND_WORDS + N_STRANDS * 4:
+            return True                      # reported by hardware, not set
         if offset == WRCMD_DATA:
             self.wrcmd_data = value & 0xFFFFFFFF
             return True
         if offset == WRCMD_CMD:
             self.wrcmd_cmd = value & 0xFFFFFFFF
             return True
-        if offset == SCRATCH0:
-            self.scratch0 = value & 0xFFFFFFFF
-            log.info("%s: scratch0 <- 0x%08x", self.name, self.scratch0)
+        if SCRATCH <= offset < SCRATCH + N_SCRATCH * 0x100 and \
+                offset % 0x100 == 0:
+            i = (offset - SCRATCH) // 0x100
+            self.scratch[i] = value & 0xFFFFFFFF
+            log.info("%s: scratch%d <- 0x%08x", self.name, i, self.scratch[i])
             return True
-        if offset == SCRATCH1:
-            self.scratch1 = value & 0xFFFFFFFF
+        if SCRATCH_SET <= offset < SCRATCH_SET + N_SCRATCH * 0x100 and \
+                offset % 0x100 == 0:
+            self.scratch[(offset - SCRATCH_SET) // 0x100] |= value & 0xFFFFFFFF
+            return True
+        if SCRATCH_CLEAR <= offset < SCRATCH_CLEAR + N_SCRATCH * 0x100 and \
+                offset % 0x100 == 0:
+            i = (offset - SCRATCH_CLEAR) // 0x100
+            self.scratch[i] &= ~value & 0xFFFFFFFF
             return True
         if offset == MEM_BASE:
             self.mem_base = value & 0xFFFFFFFF

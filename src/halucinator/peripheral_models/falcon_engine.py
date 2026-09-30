@@ -190,8 +190,47 @@ class FalconEngine(AvatarPeripheral):
     # -- interrupt lines ---------------------------------------------------
 
     def raise_line(self, num: int) -> None:
-        """Make line `num` pending, as the engine's own hardware would."""
+        """Make line `num` pending, as the engine's own hardware would.
+
+        A line that is level-triggered *and* has a modelled source cannot be
+        latched -- its status is that source's present level, and setting a bit
+        here would leave one behind that nothing can clear. The guard matters if
+        INTR_MODE is later reprogrammed to make the line edge-triggered: the
+        stale bit would come back as a spurious interrupt.
+        """
+        if (self.intr_mode >> num) & 1 and self.level_source(num) is not None:
+            return
         self.intr |= 1 << num
+
+    def level_source(self, line: int) -> Optional[bool]:
+        """Current level of a level-triggered line's source.
+
+        A latch is the wrong model for a level-triggered line: its status bit
+        *is* the source's present level, so the bit goes away when whatever
+        raised it goes away and no INTR_CLEAR write is involved. GP102 FECS
+        relies on this -- its handler acknowledges the method FIFO and returns
+        without touching INTR, so a latched bit means the handler re-enters
+        forever and the main loop never runs.
+
+        Subclasses that own such a source override this and return its level;
+        None means "not modelled", and the latch is used as before.
+        """
+        return None
+
+    def intr_status(self) -> int:
+        """INTR as hardware presents it: latched edges, live levels."""
+        status = self.intr
+        for line in range(16):
+            if not (self.intr_mode >> line) & 1:
+                continue                      # edge-triggered: the latch is it
+            level = self.level_source(line)
+            if level is None:
+                continue                      # no modelled source
+            if level:
+                status |= 1 << line
+            else:
+                status &= ~(1 << line)
+        return status & 0xFFFFFFFF
 
     def route_of(self, line: int) -> int:
         """intr.rst: a line's two routing bits come from bit N of each half."""
@@ -208,7 +247,7 @@ class FalconEngine(AvatarPeripheral):
         interrupt the core would never see. Both shipped GP102 images program
         INTR_ROUTING, so this is not hypothetical.
         """
-        live = self.intr & self.intr_en
+        live = self.intr_status() & self.intr_en
         if vector is None:
             return live
         want = ROUTE_VECTOR0 if vector == 0 else ROUTE_VECTOR1
@@ -223,7 +262,7 @@ class FalconEngine(AvatarPeripheral):
     def hw_read(self, offset: int, size: int, pc: int = 0xBAADBAAD,
                 **kwargs: Any) -> int:
         if offset == INTR:
-            return self.intr
+            return self.intr_status()
         if offset == INTR_EN:
             return self.intr_en
         if offset == INTR_MODE:
