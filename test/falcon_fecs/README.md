@@ -54,6 +54,31 @@ firmware's own error code, a request the firmware declines must move nothing,
 and the reported context size must change with the strand state by exactly the
 amount the firmware's arithmetic specifies.
 
+## Which chips
+
+Checked to complete the whole sequence -- ready, all three size queries, instance
+binding, golden-context save -- each with its own numbers:
+
+| generation | chips | image size | golden context |
+|---|---|---|---|
+| Maxwell | gm200, gm20b | 0x700 | 209 regs / 58 runs (gm200) |
+| Pascal  | gp100, gp102, gp104 | 0x1000 | 228 / 67 (gp102) |
+| Volta   | gv100 | 0x800 | 306 / 74 |
+| Turing  | tu102, tu104 | 0x700 | 249 / 60 |
+
+`test_every_available_chip_answers_the_control_methods` runs one per generation
+and requires the generations to *disagree* on their numbers: if they all answered
+identically, the answers would be coming from the model rather than the microcode.
+
+Checked and not claimed:
+
+- **gk20a** (Kepler, Tegra K1) does everything except answer the ZCULL size --
+  it replies 0, which is nouveau's `-ETIMEDOUT`. Whether that wants more setup or
+  more model is not established. Its microcode is at `nvidia/gk20a/fecs_inst.bin`,
+  not under `gr/`.
+- **Ampere and later** use a Falcon variant the processor module does not cover;
+  envydis cannot decode their SEC2 either.
+
 ## What is not modelled
 
 Stated here rather than left to be discovered, because several of these are

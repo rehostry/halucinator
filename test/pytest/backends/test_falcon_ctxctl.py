@@ -37,15 +37,27 @@ def _fecs():
     pytest.skip("no FECS microcode under FALCON_FIRMWARE_DIR")
 
 
-# The generations this model is claimed to carry, one chip each. A full
-# linux-firmware tree has eighteen chips with FECS microcode and booting all of
-# them would take hours; more to the point, the claim is not that every chip
-# works. Ampere and later use a Falcon variant the processor module does not
-# cover (envydis cannot decode their SEC2 either), so including them would fail
-# for a reason that has nothing to do with the engine model.
+# One chip per generation, and every one of them checked. A full linux-firmware
+# tree has eighteen chips with FECS microcode; booting all of them would take
+# hours, and the claim is not that every chip works.
+#
+# Verified to complete the whole sequence -- ready, three sizes, bind, golden
+# save -- with their own numbers:
+#
+#   gm200, gm20b   Maxwell     gv100          Volta
+#   gp100, gp102, gp104 Pascal tu102, tu104   Turing
+#
+# Checked and NOT included, with the reason:
+#
+#   gk20a (Kepler, Tegra K1) does everything except answer the ZCULL size: it
+#     replies 0, which is nouveau's -ETIMEDOUT. Whether that needs more setup or
+#     more model is not established, so it is not claimed. Note its microcode
+#     lives at nvidia/gk20a/fecs_inst.bin, not nvidia/gk20a/gr/.
+#   Ampere and later use a Falcon variant the processor module does not cover;
+#     envydis cannot decode their SEC2 either.
 #
 # Add a chip here when it has been checked, not in the hope that it works.
-FECS_CHIPS = ("gp102", "gp104", "tu104")
+FECS_CHIPS = ("gm200", "gp102", "gv100", "tu104")
 
 
 def _all_fecs():
@@ -55,10 +67,12 @@ def _all_fecs():
         pytest.skip(f"set {FW_ENV} to a linux-firmware nvidia/ tree")
     found = []
     for name in FECS_CHIPS:
-        inst = pathlib.Path(root) / name / "gr" / "fecs_inst.bin"
-        data = inst.with_name("fecs_data.bin")
-        if inst.is_file() and data.is_file():
-            found.append((name, inst, data))
+        base = pathlib.Path(root) / name
+        for inst in (base / "gr" / "fecs_inst.bin", base / "fecs_inst.bin"):
+            data = inst.with_name("fecs_data.bin")
+            if inst.is_file() and data.is_file():
+                found.append((name, inst, data))
+                break
     if not found:
         pytest.skip(f"none of {FECS_CHIPS} found under {root}")
     return found
@@ -1033,11 +1047,11 @@ def test_the_saved_image_carries_the_values_the_registers_held():
 def test_every_available_chip_answers_the_control_methods():
     """The model, not the image.
 
-    Pascal and Turing FECS differ: different code, different interrupt
-    enables, different vectors, and -- as it turns out -- a different place to
-    report that an MMIO-bus read has landed. Pascal waits on SIGNAL bit 6;
-    Turing polls a two-bit status field in MMIO_CTRL itself, which is why it
-    used to boot and then never report ready.
+    Four generations here -- Maxwell, Pascal, Volta, Turing -- with different
+    code, different interrupt enables, different vectors, and, as it turns out,
+    a different place to report that an MMIO-bus read has landed: Pascal waits
+    on SIGNAL bit 6 while Turing polls a two-bit status field in MMIO_CTRL
+    itself, which is why Turing used to boot and then never report ready.
 
     Each chip here must reach ready, answer all three size queries, bind an
     instance pointer and complete a golden-context save. The sizes are not
