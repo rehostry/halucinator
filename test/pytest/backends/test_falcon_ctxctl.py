@@ -847,3 +847,75 @@ def test_the_saved_register_ranges_agree_with_nouveau_s_own_tables():
     assert len(hit) >= len(runs) * 0.6, (
         f"only {len(hit)} of {len(runs)} runs land on a register nouveau calls "
         "part of a graphics context -- the decode is probably wrong")
+
+
+def test_two_contexts_at_different_bases_do_not_collide():
+    """The base registers decide which image a transfer touches.
+
+    This is what makes the image memory rather than a buffer. MMCTX_SAVE_SWBASE
+    and MMCTX_LOAD_SWBASE name the address, stored shifted right by eight, and
+    the engine reaches it through MEMIF -- so saving two contexts to two bases
+    leaves two images, and a load can only return what a save to *that* base
+    put there.
+
+    A flat per-transfer buffer passes a save-then-load round trip while getting
+    this wrong: the second save overwrites the first and the load returns
+    whichever ran last, whatever base it was asked for. That is the failure this
+    exists to catch, and context switching is exactly the case where it matters.
+    """
+    from halucinator.peripheral_models.falcon_ctxctl import (
+        FalconCtxctl, MMCTX_CTRL, MMCTX_QUEUE, MMCTX_DIR, MMCTX_SAVE_SWBASE,
+        MMCTX_LOAD_SWBASE, MMCTX_START_TRIGGER, MMCTX_STOP_TRIGGER,
+        Q_CNTM1_SHIFT)
+
+    reg = 0x404000
+    first = [0xAAAA0000 + i for i in range(4)]
+    second = [0xBBBB0000 + i for i in range(4)]
+    eng = FalconCtxctl("mmctx", 0x0, 0x40000,
+                       bar0={reg + i * 4: first[i] for i in range(4)})
+    descriptor = (reg >> 2 << 2) | (3 << Q_CNTM1_SHIFT)
+
+    def transfer(direction, swbase_reg, swbase):
+        eng.hw_write(swbase_reg, 4, swbase)
+        eng.hw_write(MMCTX_CTRL, 4, 0x1000 | direction | MMCTX_START_TRIGGER)
+        eng.hw_write(MMCTX_QUEUE, 4, descriptor)
+        eng.hw_write(MMCTX_CTRL, 4, 0x1000 | direction | MMCTX_STOP_TRIGGER)
+
+    transfer(0, MMCTX_SAVE_SWBASE, 0x100)          # image A at 0x10000
+    assert eng.mmctx_image == first
+    for i in range(4):
+        eng.bar0_write(reg + i * 4, second[i])
+    transfer(0, MMCTX_SAVE_SWBASE, 0x200)          # image B at 0x20000
+    assert eng.mmctx_image == second, "the second save did not take"
+
+    for i in range(4):
+        eng.bar0_write(reg + i * 4, 0)
+    transfer(MMCTX_DIR, MMCTX_LOAD_SWBASE, 0x100)  # ask for A back
+    assert [eng.bar0_read(reg + i * 4) for i in range(4)] == first, (
+        "loading base A returned something else -- the base was ignored")
+    # Both images are still there; the load did not consume or move either.
+    assert len(eng.ctx_memory) == 8
+
+
+def test_a_load_from_a_base_never_saved_leaves_the_registers_alone():
+    """The control for the test above, and a deliberate choice.
+
+    A word that was never saved is not restored. Writing zero would be worse
+    than leaving the register untouched: it would look like a successful restore
+    of a context that had never been captured, which is precisely the kind of
+    quiet wrong answer this model is built to avoid.
+    """
+    from halucinator.peripheral_models.falcon_ctxctl import (
+        FalconCtxctl, MMCTX_CTRL, MMCTX_QUEUE, MMCTX_DIR, MMCTX_LOAD_SWBASE,
+        MMCTX_START_TRIGGER, MMCTX_STOP_TRIGGER, Q_CNTM1_SHIFT)
+
+    reg = 0x404000
+    live = [0xC0DE0000 + i for i in range(4)]
+    eng = FalconCtxctl("mmctx", 0x0, 0x40000,
+                       bar0={reg + i * 4: live[i] for i in range(4)})
+    eng.hw_write(MMCTX_LOAD_SWBASE, 4, 0x900)      # nothing was ever saved here
+    eng.hw_write(MMCTX_CTRL, 4, 0x1000 | MMCTX_DIR | MMCTX_START_TRIGGER)
+    eng.hw_write(MMCTX_QUEUE, 4, (reg >> 2 << 2) | (3 << Q_CNTM1_SHIFT))
+    eng.hw_write(MMCTX_CTRL, 4, 0x1000 | MMCTX_DIR | MMCTX_STOP_TRIGGER)
+    assert eng.mmctx_loaded == 0, "restored words that were never saved"
+    assert [eng.bar0_read(reg + i * 4) for i in range(4)] == live

@@ -337,11 +337,15 @@ class FalconCtxctl(FalconEngine):
         self.strand_select = 0
         self.strand_filter = 0
         self.strand_data = 0
-        # MMCTX. `mmctx_image` stands in for the memory the engine would reach
-        # through MEMIF: a save appends register values to it and a load reads
-        # them back, so a save followed by a load is a round trip that can be
-        # checked. `mmctx_runs` records the register ranges each descriptor
-        # named, which is the firmware's own register list made observable.
+        # MMCTX. `ctx_memory` stands in for the memory the engine reaches
+        # through MEMIF, word-addressed. A save writes register values there
+        # starting at MMCTX_SAVE_SWBASE and a load reads them back from
+        # MMCTX_LOAD_SWBASE, so the base registers decide *which* image a
+        # transfer touches -- two contexts at different bases do not collide,
+        # and a load can only return what a save to that base put there.
+        # `mmctx_runs` records the register ranges each descriptor named, which
+        # is the firmware's own register list made observable.
+        self.ctx_memory: Dict[int, int] = {}
         self.mmctx_base = 0
         self.mmctx_multi_stride = 0
         self.mmctx_multi_mask = 0
@@ -349,11 +353,12 @@ class FalconCtxctl(FalconEngine):
         self.mmctx_qlimit = 0
         self.mmctx_dir = 0
         self.mmctx_running = False
-        self.mmctx_image = []
         self.mmctx_cursor = 0
         self.mmctx_runs = []
         self.mmctx_saved = 0
         self.mmctx_loaded = 0
+        # (memory address, word count) of the most recent transfer.
+        self.mmctx_last = (0, 0)
 
     # -- the scratch bank, as the driver sees it ---------------------------
     #
@@ -540,6 +545,22 @@ class FalconCtxctl(FalconEngine):
                 | ((self.mmctx_qlimit & MMCTX_QLIMIT_MASK) << MMCTX_QLIMIT_SHIFT)
                 | (MMCTX_DIR if self.mmctx_dir else 0))
 
+    def _mmctx_image_base(self) -> int:
+        """The memory address this transfer works from.
+
+        Both base registers are stored shifted right by eight (rnndb marks them
+        `shr="8"`), so the value names a 256-byte unit.
+        """
+        base = self.mmctx_load_base if self.mmctx_dir else self.mmctx_save_base
+        return (base << 8) & 0xFFFFFFFF
+
+    @property
+    def mmctx_image(self):
+        """The words of the most recent transfer, read back out of memory."""
+        base, words = self.mmctx_last
+        return [self.ctx_memory.get((base + i * 4) & 0xFFFFFFFF, 0)
+                for i in range(words)]
+
     def _mmctx_write_ctrl(self, value: int) -> None:
         self.mmctx_qlimit = (value >> MMCTX_QLIMIT_SHIFT) & MMCTX_QLIMIT_MASK
         self.mmctx_dir = 1 if value & MMCTX_DIR else 0
@@ -547,15 +568,17 @@ class FalconCtxctl(FalconEngine):
             self.mmctx_running = True
             self.mmctx_cursor = 0
             self.mmctx_runs = []
-            if not self.mmctx_dir:
-                self.mmctx_image = []          # a save starts a fresh image
-            log.info("%s: MMCTX %s started, queue limit %d", self.name,
-                     "load" if self.mmctx_dir else "save", self.mmctx_qlimit)
+            self.mmctx_last = (self._mmctx_image_base(), 0)
+            log.info("%s: MMCTX %s started at 0x%08x, queue limit %d", self.name,
+                     "load" if self.mmctx_dir else "save",
+                     self._mmctx_image_base(), self.mmctx_qlimit)
         if value & MMCTX_STOP_TRIGGER:
             self.mmctx_running = False
-            log.info("%s: MMCTX %s done, %d registers, %d words in the image",
+            self.mmctx_last = (self._mmctx_image_base(), self.mmctx_cursor)
+            log.info("%s: MMCTX %s done, %d registers, %d words at 0x%08x",
                      self.name, "load" if self.mmctx_dir else "save",
-                     sum(n for _a, n in self.mmctx_runs), len(self.mmctx_image))
+                     sum(n for _a, n in self.mmctx_runs), self.mmctx_cursor,
+                     self._mmctx_image_base())
 
     def _mmctx_queue(self, desc: int) -> None:
         """Carry out one queue descriptor.
@@ -589,14 +612,19 @@ class FalconCtxctl(FalconEngine):
             self.mmctx_runs.append((start, count))
             for i in range(count):
                 reg = start + i * 4
+                where = (self._mmctx_image_base()
+                         + self.mmctx_cursor * 4) & 0xFFFFFFFF
                 if self.mmctx_dir:
-                    if self.mmctx_cursor < len(self.mmctx_image):
-                        self.bar0_write(reg, self.mmctx_image[self.mmctx_cursor])
+                    if where in self.ctx_memory:
+                        self.bar0_write(reg, self.ctx_memory[where])
                         self.mmctx_loaded += 1
-                    self.mmctx_cursor += 1
+                    # A word never saved is not restored. Writing zero would be
+                    # worse than leaving the register alone: it would look like
+                    # a successful restore of a context that was never captured.
                 else:
-                    self.mmctx_image.append(self.bar0_read(reg))
+                    self.ctx_memory[where] = self.bar0_read(reg)
                     self.mmctx_saved += 1
+                self.mmctx_cursor += 1
 
     def live_registers(self):
         return tuple(super().live_registers()) + (
