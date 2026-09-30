@@ -94,6 +94,10 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
         self._halt_pc: Optional[int] = None
         self._step_fault_pc: Optional[int] = None
         self._regions: List[MemoryRegion] = []
+        # (name, path, file size, region size) for any image whose tail
+        # did not fit its region. A test can assert this is empty; the
+        # log line alone is too easy to miss.
+        self.truncated_regions: List[tuple] = []
         self._breakpoints: Dict[int, int] = {}  # addr -> bp_id
         # Watchpoints: bp_id -> (addr, size, read, write)
         self._watchpoints: Dict[int, tuple] = {}
@@ -202,10 +206,34 @@ class GhidraBackend(InProcessIrqMixin, ARM32HalMixin, HalBackend):
                 else:
                     space = named
             start = space.getAddress(region.base_addr)
+            if region.file and not os.path.isfile(region.file):
+                # A region that names a file is declaring a dependency. Falling
+                # through to an uninitialised block gives the guest a page of
+                # zeros, and a zeroed image *executes* -- it runs for a while
+                # and produces plausible-looking numbers before stopping
+                # somewhere arbitrary, which is indistinguishable from firmware
+                # that needs more steps. Refuse instead.
+                raise FileNotFoundError(
+                    f"region {region.name!r} names {region.file!r}, which does "
+                    f"not exist; a missing image would be loaded as zeros and "
+                    f"the guest would execute them"
+                )
             try:
-                if region.file and os.path.isfile(region.file):
+                if region.file:
                     with open(region.file, "rb") as fh:
                         data = fh.read(region.size)
+                    whole = os.path.getsize(region.file)
+                    if whole > region.size:
+                        # The other half of the same trap: the tail of the image
+                        # is dropped and the guest runs into whatever follows.
+                        self.truncated_regions.append(
+                            (region.name, region.file, whole, region.size))
+                        log.error(
+                            "GhidraBackend: region %s is 0x%x bytes but %s is "
+                            "0x%x -- 0x%x bytes of the image were DROPPED",
+                            region.name, region.size, region.file, whole,
+                            whole - region.size,
+                        )
                     if len(data) < region.size:
                         data = data + b"\x00" * (region.size - len(data))
                     from java.io import ByteArrayInputStream  # type: ignore
