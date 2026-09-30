@@ -204,6 +204,29 @@ SCRATCH_INSTANCE = 4
 BIND_DONE, BIND_ERROR = 0x10, 0x20
 GOLDEN_DONE, GOLDEN_ERROR = 0x01, 0x02
 
+# The unit counts, and the barrier mask the firmware derives from them.
+#
+# FECS reads BAR0 0x409604 three times at 0x4fb7-0x4fee and keeps three fields:
+#
+#   bits 0:4    GPC_COUNT  -> DMEM 0x7b8, and BAR_REQMASK = (1 << it) - 1
+#   bits 16:20  ROP_COUNT  -> DMEM 0x7bc, with 6 at 0x7c0 and 2x it at 0x7c4
+#   bits 24:28  unnamed upstream -> DMEM 0x7c8
+#
+# Those three DMEM words are what the PerfMon size is computed from, so seeding
+# this register changes the answer FECS gives -- which is the point: the size is
+# a property of the modelled GPU, not of this code. rnndb names the first two
+# fields; the third it does not name at all.
+#
+# The barrier mask is where GPCs come in. With GPC_COUNT = 0 the mask is 0, so
+# no GPC has to arrive at a barrier and FECS runs alone. Give it a non-zero count
+# and it requires that many to arrive -- and since no GPCCS is co-simulated here,
+# it does not reach ready. That limit is asserted rather than hidden.
+BAR0_HUB_UNITS = 0x409604
+UNITS_GPC_SHIFT, UNITS_GPC_MASK = 0, 0x1F
+UNITS_ROP_SHIFT, UNITS_ROP_MASK = 16, 0x1F
+
+BAR_REQMASK0, BAR_REQMASK1, BAR_STATE = 0x10300, 0x10400, 0x10500
+
 # MMCTX: the engine that moves the MMIO half of a context image. Names and
 # fields from rnndb graph/gf100_pgraph/ctxctl.xml (BAR0 0x700-0x74c).
 #
@@ -652,6 +675,7 @@ class FalconCtxctl(FalconEngine):
             WRCMD_DATA, WRCMD_CMD,
             FIFO_DATA, FIFO_CMD, FIFO_OCCUPIED, FIFO_ACK,
             STRANDS_CNT, STRAND_STATUS,
+            BAR_REQMASK0, BAR_REQMASK1, BAR_STATE,
             STRAND_CMD + STRAND_BROADCAST, STRAND_FILTER + STRAND_BROADCAST,
             STRAND_SELECT + STRAND_BROADCAST, STRAND_DATA + STRAND_BROADCAST,
         ) + tuple(SCRATCH + i * 0x100 for i in range(N_SCRATCH)) \

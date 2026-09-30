@@ -374,18 +374,23 @@ def _expected_zcull_size():
     return 0x100
 
 
-def _expected_pm_size():
+def _expected_pm_size(rop_count):
     """The PerfMon image size, which is a sum of two rounded terms.
 
     The routine at 0x1e23 calls the unit-size getter at 0x43f twice and adds the
-    results (0x1e54). Both go through that getter's round-to-256 tail:
+    results at 0x1e54; both go through that getter's round-to-256 tail at 0x4a6.
 
-      * index 0xa is derived from the TPC and GPC counts in DMEM 0x7bc/0x7c0/
-        0x7c4. With no units modelled those are zero, so the term rounds to one
+      * index 0xa computes over the three words FECS derived from HUB_UNITS --
+        `T` at DMEM 0x7bc, a constant 6 at 0x7c0 and `2*T` at 0x7c4 -- as
+        `24*T + 4*(T * 0x10e) + 4*6 + 12*(2*T)`, which is `1128*T + 24`. With no
+        units modelled T is zero and the term is just the 24, rounding to one
         unit.
       * index 2 is the firmware constant 0x6f0, which rounds to 0x700.
+
+    The T=1 and T=2 values (0xc00 and 0x1000) were written down from this and
+    checked by hand before either was run.
     """
-    return _round_up_256(0) + _round_up_256(0x6F0)
+    return _round_up_256(1128 * rop_count + 24) + _round_up_256(0x6F0)
 
 
 def test_one_method_is_dispatched_once():
@@ -557,7 +562,7 @@ def test_nouveau_s_init_sequence_runs_to_completion():
     # wrong one is a wrong number rather than a missing reply.
     want = {"size": _expected_image_size([0] * 9),
             "size_zcull": _expected_zcull_size(),
-            "size_pm": _expected_pm_size()}
+            "size_pm": _expected_pm_size(0)}
     sizes = {}
     for name, mthd in (("size", MTHD_DISCOVER_IMAGE_SIZE),
                        ("size_zcull", MTHD_DISCOVER_ZCULL_IMAGE_SIZE),
@@ -1093,3 +1098,88 @@ def test_every_available_chip_answers_the_control_methods():
     if len(families) > 1:
         assert len(set(results.values())) > 1, (
             f"every chip answered identically across generations: {results}")
+
+
+# ---------------------------------------------------------------------------
+# The unit counts: the size FECS reports is a property of the modelled GPU.
+# ---------------------------------------------------------------------------
+
+def test_the_perfmon_size_follows_the_unit_count():
+    """Change the GPU's shape, and the answer FECS gives changes with it.
+
+    The falsification knob for the size queries, on a different input from the
+    strand one. FECS reads BAR0 0x409604 during init and keeps three fields from
+    it; the PerfMon size is computed from them. Seeding a different ROP count has
+    to move the answer by exactly what the firmware's arithmetic says, and the
+    intermediate DMEM words have to hold what the derivation claims -- otherwise
+    a matching total could be a coincidence.
+    """
+    from halucinator.peripheral_models.falcon_ctxctl import (
+        BAR0_HUB_UNITS, UNITS_ROP_SHIFT, MTHD_DISCOVER_PM_IMAGE_SIZE)
+
+    for rop in (1, 2):
+        be, eng, _ = _boot(bar0={BAR0_HUB_UNITS: rop << UNITS_ROP_SHIFT})
+        assert eng.scratch0, f"rop={rop}: never reported ready"
+        # The three words the derivation rests on.
+        assert be.read_memory(0x7BC, 4, 1, space="dmem") == rop
+        assert be.read_memory(0x7C0, 4, 1, space="dmem") == 6
+        assert be.read_memory(0x7C4, 4, 1, space="dmem") == 2 * rop
+        got = eng.fecs_call(be, MTHD_DISCOVER_PM_IMAGE_SIZE, 0)
+        assert got == _expected_pm_size(rop), (
+            f"rop={rop}: FECS reported 0x{got:x}, expected "
+            f"0x{_expected_pm_size(rop):x}")
+        assert got != _expected_pm_size(0), (
+            "the size did not respond to the unit count at all")
+        assert be._step_fault_pc is None
+
+
+def test_a_non_zero_gpc_count_makes_fecs_wait_for_gpcs_that_are_not_modelled():
+    """A limit, asserted rather than left to be discovered.
+
+    FECS turns GPC_COUNT into a barrier mask at 0x5001: `(1 << count) - 1`, the
+    set of GPCs that must arrive before it passes a barrier. With no count the
+    mask is empty and FECS runs alone, which is why everything else here works.
+    Tell it there are GPCs and it requires them -- and nothing co-simulates
+    GPCCS, so it does not reach ready.
+
+    Both halves are asserted: the mask really is derived from the count given
+    (so the register is reaching the microcode), and the consequence is the stall
+    (so the limit is recorded). If GPCCS is ever co-simulated this test should
+    fail, and that failure is the signal to rewrite it.
+    """
+    from halucinator.peripheral_models.falcon_ctxctl import (
+        BAR0_HUB_UNITS, UNITS_GPC_SHIFT, BAR_REQMASK0, BAR_REQMASK1)
+
+    gpcs = 2
+    be, eng, _ = _boot(bar0={BAR0_HUB_UNITS: gpcs << UNITS_GPC_SHIFT})
+    assert be.read_memory(0x7B8, 4, 1, space="dmem") == gpcs, (
+        "the GPC count never reached the microcode")
+    want = (1 << gpcs) - 1
+    assert eng.hw_read(BAR_REQMASK0, 4) == want, (
+        f"barrier mask is 0x{eng.hw_read(BAR_REQMASK0, 4):x}, expected 0x{want:x}")
+    assert eng.hw_read(BAR_REQMASK1, 4) == want
+    assert not eng.scratch0, (
+        "FECS reported ready with GPCs it cannot have heard from -- if GPCCS is "
+        "now co-simulated, this test needs rewriting rather than deleting")
+    assert be._step_fault_pc is None
+
+
+def test_this_module_defines_nothing_twice():
+    """A shadowed helper is a silent failure mode, so guard against it.
+
+    Adding a second `_expected_pm_size` -- a generalisation of an existing
+    no-argument helper -- silently replaced it, and the caller that passed no
+    arguments failed with a TypeError an hour into a suite run. That was the
+    lucky case. Had the signatures been compatible the tests would have gone on
+    passing while checking the wrong expectation, which is far worse and is
+    exactly the shape of defect this file exists to catch elsewhere.
+    """
+    import ast
+    import collections
+
+    tree = ast.parse(pathlib.Path(__file__).read_text())
+    names = [n.name for n in tree.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef))]
+    dupes = [n for n, c in collections.Counter(names).items() if c > 1]
+    assert not dupes, f"defined more than once at module level: {dupes}"
